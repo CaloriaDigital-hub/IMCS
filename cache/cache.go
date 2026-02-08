@@ -1,14 +1,21 @@
 package cache
 
 import (
+	"os"
 	"time"
 )
 
 
 
-func New() *Cache {
+func New(dir string) *Cache {
 	c := &Cache{
 		items: make(map[string]Item),
+		storageDir: dir,
+	}
+
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		panic("Cannot create storage directory: " + err.Error())
 	}
 
 	go c.startJanitor()

@@ -14,8 +14,10 @@ type Item struct {
 }
 
 type Cache struct {
-	mu 		sync.RWMutex
-	items 	map[string]Item
+	mu 			sync.RWMutex
+	items 		map[string]Item
+	storageDir	string
+
 
 }
 

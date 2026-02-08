@@ -2,25 +2,23 @@ package cache
 
 import (
 	"encoding/gob"
-	"log"
 	"fmt"
+	"log"
 	"os"
-
+	"path/filepath"
 )
 
 func (c *Cache) SaveToFile(filename string) error {
-	dir := "../cache-files/"
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		log.Printf("Не удалось создать директорию: %v", err)
-	}
+	path := filepath.Join(c.storageDir, filename)
+	
 
-	file, err := os.Create(dir + filename)
+	file, err := os.Create(path)
 	if err != nil {
 		log.Printf("Ошибка при создании файла: %v", err)
 		return err
 	}
 
-defer file.Close()
+	defer file.Close()
 
 	encoder := gob.NewEncoder(file)
 	
