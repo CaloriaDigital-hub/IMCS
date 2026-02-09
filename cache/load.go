@@ -3,11 +3,13 @@ package cache
 import (
 	"encoding/gob"
 	"os"
+	"path/filepath"
 )
 
 func (c *Cache) LoadFromFile(filename string) error {
-	file, err := os.Open("../cache-files/" + filename)
+	path := filepath.Join(c.storageDir, filename)
 
+	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -27,7 +29,7 @@ func (c *Cache) LoadFromFile(filename string) error {
 		return err
 	}
 
-	return nil
+	return decoder.Decode(&c.items)
 
 
 }
