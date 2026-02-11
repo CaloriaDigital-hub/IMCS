@@ -20,7 +20,7 @@ func (c *Cache) LoadFromFile(filename string) error {
 
 	defer file.Close()
 
-	decoder :=  gob.NewDecoder(file)
+	decoder := gob.NewDecoder(file)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()

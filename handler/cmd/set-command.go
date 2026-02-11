@@ -13,11 +13,6 @@ import (
 func handleSet(args []string, c *cache.Cache) []byte {
 	
 
-	if len(args) == 2 {
-		c.Set(args[0], args[1], 0)
-		return []byte("OK\n")
-
-	}
 
 	if len(args) == 3 {
 		ttlSec, err := strconv.Atoi(args[2])
