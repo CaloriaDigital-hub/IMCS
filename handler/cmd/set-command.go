@@ -3,6 +3,7 @@ package cmd
 import (
 	"imcs/cache"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -11,18 +12,47 @@ import (
 
 
 func handleSet(args []string, c *cache.Cache) []byte {
+
 	
-
-
+	
 	if len(args) == 3 {
-		ttlSec, err := strconv.Atoi(args[2])
 
-		if err != nil {
-			return []byte("ERR invalid TTL format\n")
+		key := args[0]
+		value := args[1]
+		var ttl time.Duration
+		var nx bool
+
+
+		for i := 2; i < len(args); i++ {
+			arg := strings.ToUpper(args[i])
+
+			if arg == "NX" {
+				nx = true
+				continue
+			}
+
+			ttlInt, err := strconv.Atoi(arg)		
+
+			if err == nil {
+				ttl =  time.Duration(ttlInt) * time.Second
+				continue
+			}
+
+
+			return []byte("ERR syntex error\n")
+
+		
+
 		}
 
-		c.Set(args[0], args[1], time.Duration(ttlSec)*time.Second)
-		return  []byte("OK\n")
+		err := c.Set(key, value, ttl, nx)
+		
+
+		if err == cache.ErrKeyExist {
+			return []byte("(nil)\n")
+		}
+
+		return []byte("OK\n")
 	}
 
 	return []byte("ERR wrong number of args for 'set'\n")

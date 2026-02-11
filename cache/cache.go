@@ -3,9 +3,10 @@ package cache
 import (
 	"os"
 	"time"
+	"errors"
 )
 
-
+var ErrKeyExist = errors.New("key already exists")
 
 func New(dir string) *Cache {
 	c := &Cache{
@@ -25,7 +26,9 @@ func New(dir string) *Cache {
 	
 }
 
-func (c *Cache) Set(key, value string, duration time.Duration) {
+
+
+func (c *Cache) Set(key, value string, duration time.Duration, nx bool) error {
 
 	var expiration int64
 
@@ -36,12 +39,26 @@ func (c *Cache) Set(key, value string, duration time.Duration) {
 	defer c.mu.Unlock()
 
 
+	if nx {
+		item, found := c.items[key]
+
+		if found {
+			if item.Expiration == 0 || item.Expiration > time.Now().UnixNano() {
+				return ErrKeyExist
+			}
+		}
+	}
+
+
 	c.items[key] = Item{
 		Value: value,
 		Created: time.Now(),
 		Expiration: expiration,
 		
 	}
+
+	return nil
+
 }
 
 func (c *Cache) Get(key string) (string, bool) {
