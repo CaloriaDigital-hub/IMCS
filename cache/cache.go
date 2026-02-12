@@ -22,7 +22,9 @@ func New(dir string) *Cache {
 
 
 	err = c.persister.Read(func(cmd string, key string, value string, expire int64) {
-		if cmd == "SET" {
+
+		switch cmd {
+		case "SET":
 			if expire > 0 && expire <time.Now().UnixNano() {
 				return 
 			}
@@ -32,8 +34,11 @@ func New(dir string) *Cache {
 				Expiration: expire,
 				Created: time.Now(),
 			}
-		} else if cmd == "DEL" {
+		case "DEL":
+
 			delete(c.items, key)
+
+
 		}
 	})
 
