@@ -1,22 +1,44 @@
 package cache
 
 import (
-	"os"
 	"time"
 	"errors"
+	"imcs/persistence/AOF"
 )
 
 var ErrKeyExist = errors.New("key already exists")
 
 func New(dir string) *Cache {
+
+	aof, err := AOF.NewAOF(dir)
+
+	if err != nil {
+		panic("Cannot open AOF: " + err.Error())
+	}
 	c := &Cache{
 		items: make(map[string]Item),
-		storageDir: dir,
+		persister: aof,
 	}
 
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		panic("Cannot create storage directory: " + err.Error())
+	err = c.persister.Read(func(cmd string, key string, value string, expire int64) {
+		if cmd == "SET" {
+			if expire > 0 && expire <time.Now().UnixNano() {
+				return 
+			}
+
+			c.items[key] = Item{
+				Value: value,
+				Expiration: expire,
+				Created: time.Now(),
+			}
+		} else if cmd == "DEL" {
+			delete(c.items, key)
+		}
+	})
+
+	if err != nil {
+		println("Error restoring AOF: ", err.Error())
 	}
 
 	go c.startJanitor()
@@ -57,6 +79,13 @@ func (c *Cache) Set(key, value string, duration time.Duration, nx bool) error {
 		
 	}
 
+	go c.persister.Write(AOF.WriteInput{
+		Cmd: "SET",
+		Key: key,
+		Value: value,
+		TTL: duration,
+	})
+
 	return nil
 
 }
@@ -82,11 +111,16 @@ func (c *Cache) Get(key string) (string, bool) {
 
 func (c *Cache) Delete(key string) {
 	c.mu.Lock()
-
+	delete(c.items, key)
 	defer c.mu.Unlock()
 
 
-	delete(c.items, key)
+
+	go c.persister.Write(AOF.WriteInput{
+		Cmd: "DEL",
+		Key: key,
+	})
+	
 
 	
 
