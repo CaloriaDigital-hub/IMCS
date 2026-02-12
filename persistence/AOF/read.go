@@ -2,14 +2,23 @@ package AOF
 
 import (
 	"bufio"
-	
+
 	"strconv"
 	"strings"
 )
 
 
-
-func(a *AOF) Read(rf func(cmd, key, value string, expire int64)) error {
+		// Package AOF предоставляет механизмы для работы с журналом команд (append-only file).
+		//
+		// Файл read.go содержит функцию Read, которая читает команды из файла журнала и передает их обработчику.
+		//
+		// Read:
+		//   - Считывает строки из файла журнала команд.
+		//   - Каждая строка должна содержать команду, ключ, время истечения (expire) и значение, разделённые символом '|'.
+		//   - Если строка не соответствует формату или время истечения некорректно, она пропускается.
+		//   - Для каждой корректной строки вызывается переданная функция-обработчик rf(cmd, key, value, expire).
+		//   - Функция блокирует доступ к файлу на время чтения.
+func (a *AOF) Read(rf func(cmd, key, value string, expire int64)) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -31,6 +40,8 @@ func(a *AOF) Read(rf func(cmd, key, value string, expire int64)) error {
 		cmd := parts[0]
 		key := parts[1]
 		expireStr := parts[2]
+
+
 		value := parts[3]
 
 		expire, err := strconv.ParseInt(expireStr, 10, 64)
@@ -40,7 +51,6 @@ func(a *AOF) Read(rf func(cmd, key, value string, expire int64)) error {
 		}
 
 		rf(cmd, key, value, expire)
-
 
 	}
 
