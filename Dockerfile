@@ -1,22 +1,14 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.22-alpine AS builder
 WORKDIR /app
-
 COPY go.mod ./
 RUN go mod download
-
 COPY . .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o imcs ./cmd/imcs/
 
-RUN go build -o imcs-server main.go
-
-
-FROM alpine:latest
-
-WORKDIR /root/
-
-RUN mkdir -p cache-files
-
-COPY --from=builder /app/imcs-server .
-
-EXPOSE 8080
-
-CMD ["./imcs-server"]
+FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
+WORKDIR /data
+COPY --from=builder /app/imcs /usr/local/bin/imcs
+EXPOSE 6380
+VOLUME /data
+ENTRYPOINT ["imcs", "-dir", "/data", "-port", ":6380"]
