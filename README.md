@@ -345,6 +345,22 @@ IMCS/
 
 ---
 
+## Benchmarking Environment
+
+Benchmarks were performed on the following hardware and software setup to ensure reproducibility:
+
+## Hardware
+*   **CPU:** Intel(R) Core(TM) i9-13900H (14 Cores / 20 Threads)
+    *   **Max Turbo Frequency:** 5.40 GHz
+    *   **L3 Cache:** 24 MiB
+*   **RAM:** 16 GB DDR5 4800 MT/s (2x8GB)
+*   **Architecture:** x86_64
+
+## Software
+*   **OS:** Linux Mint 22.3 (Zena)
+*   **Kernel:** 6.17.0-14-generic
+*   **Go Version:** go1.25.6 linux/amd64
+
 ## Конфигурация
 
 ### Флаги командной строки
