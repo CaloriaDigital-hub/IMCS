@@ -161,12 +161,14 @@ func (s *shard) expire(key string, expireAt int64) bool {
 func (s *shard) ttl(key string) int64 {
 	s.RLock()
 	item, exists := s.items[key]
-	s.RUnlock()
 
 	if !exists || item.IsExpired() {
 		return -2
 	}
-	if item.ExpireAt == 0 {
+
+	expireAt := item.ExpireAt
+	s.RUnlock()
+	if expireAt == 0 {
 		return -1
 	}
 	remaining := item.ExpireAt - time.Now().UnixNano()
