@@ -8,8 +8,13 @@ import (
 	"time"
 )
 
-// AOF — append-only file для персистенции команд.
-// Запись через буферизованный канал — одна горутина-writer.
+/*
+
+ 	AOF — append-only file для персистенции команд.
+ 	Запись через буферизованный канал — одна горутина-writer.
+
+*/
+
 type AOF struct {
 	file    *os.File
 	dir     string
