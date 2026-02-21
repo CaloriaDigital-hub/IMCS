@@ -123,8 +123,9 @@ func (s *shard) del(key string) bool {
 // exists проверяет существование ключа (с учётом TTL).
 func (s *shard) exists(key string) bool {
 	s.RLock()
+	defer s.RUnlock()
 	item, exists := s.items[key]
-	s.RUnlock()
+	
 
 	if !exists {
 		return false
@@ -256,7 +257,7 @@ func (s *shard) appendVal(key, suffix string) (int, bool) {
 func (s *shard) strlen(key string) int {
 	s.RLock()
 	item, exists := s.items[key]
-	s.RUnlock()
+	defer s.RUnlock()
 
 	if !exists || item.IsExpired() {
 		return 0
