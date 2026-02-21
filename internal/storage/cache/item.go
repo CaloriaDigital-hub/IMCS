@@ -7,9 +7,10 @@ import (
 
 const staleThreshold = 7 * 24 * time.Hour // 1 неделя
 
-// IsExpired проверяет, истёк ли TTL элемента.
+// IsExpired проверяет, истёк ли TTL элемента. Thread-safe (atomic).
 func (i *Item) IsExpired() bool {
-	return i.ExpireAt > 0 && time.Now().UnixNano() > i.ExpireAt
+	expireAt := atomic.LoadInt64(&i.ExpireAt)
+	return expireAt > 0 && time.Now().UnixNano() > expireAt
 }
 
 // IsStale проверяет, не использовался ли элемент больше недели.

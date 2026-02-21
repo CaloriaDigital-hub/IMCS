@@ -36,7 +36,7 @@ func (s *shard) set(key, value string, expireAt int64) bool {
 
 	if item, exist := s.items[key]; exist {
 		item.Value = value
-		item.ExpireAt = expireAt
+		atomic.StoreInt64(&item.ExpireAt, expireAt)
 		atomic.StoreInt64(&item.LastAccess, now)
 		// Обновляем heap
 		if expireAt > 0 {
@@ -65,42 +65,46 @@ func (s *shard) set(key, value string, expireAt int64) bool {
 	return true
 }
 
-// get возвращает значение из шарда. Если ключ истёк — удаляет его.
+// get возвращает значение из шарда. Если ключ истёк — удаляет его (lazy expiry).
 func (s *shard) get(key string) (string, bool) {
 	s.RLock()
 	item, exists := s.items[key]
-	
-
 	if !exists {
 		s.RUnlock()
 		return "", false
 	}
 
-	if item.IsExpired() {
+	// Читаем всё под RLock — race-safe
+	expireAt := atomic.LoadInt64(&item.ExpireAt)
+	if expireAt > 0 && time.Now().UnixNano() > expireAt {
+		// Ключ протух — нужен write lock для удаления
 		s.RUnlock()
-
-		// Тут я делаю upgrade до write lock для удаления
-
 		s.Lock()
-		if item, exists = s.items[key]; exists && item.IsExpired() {
+		item, exists = s.items[key]
+		if exists && item.IsExpired() {
 			delete(s.items, key)
 			if item.HeapIndex >= 0 {
 				heap.Remove(&s.pq, item.HeapIndex)
 			}
-
-
-			
+			s.Unlock()
+			return "", false
 		}
+		// Ключ обновили пока ждали Lock — вернём актуальное значение
+		if !exists {
+			s.Unlock()
+			return "", false
+		}
+		val := item.Value
+		atomic.StoreInt64(&item.LastAccess, nowCached())
 		s.Unlock()
-		return "", false
+		return val, true
 	}
 
-
-	value := item.Value // Копирайт под блоком
-	s.RUnlock()
-
+	// Fast path: не протух — копируем и возвращаем
+	val := item.Value
 	atomic.StoreInt64(&item.LastAccess, nowCached())
-	return value, true
+	s.RUnlock()
+	return val, true
 }
 
 // del удаляет ключ из шарда. Возвращает true, если ключ был удалён.
@@ -123,14 +127,18 @@ func (s *shard) del(key string) bool {
 // exists проверяет существование ключа (с учётом TTL).
 func (s *shard) exists(key string) bool {
 	s.RLock()
-	defer s.RUnlock()
 	item, exists := s.items[key]
-	
-
 	if !exists {
+		s.RUnlock()
 		return false
 	}
-	return !item.IsExpired()
+	expireAt := atomic.LoadInt64(&item.ExpireAt)
+	s.RUnlock()
+
+	if expireAt > 0 && time.Now().UnixNano() > expireAt {
+		return false
+	}
+	return true
 }
 
 // expire устанавливает TTL на существующий ключ. Возвращает true если ключ найден.
@@ -143,7 +151,7 @@ func (s *shard) expire(key string, expireAt int64) bool {
 		return false
 	}
 
-	item.ExpireAt = expireAt
+	atomic.StoreInt64(&item.ExpireAt, expireAt)
 	if expireAt > 0 {
 		if item.HeapIndex >= 0 {
 			heap.Fix(&s.pq, item.HeapIndex)
@@ -161,17 +169,20 @@ func (s *shard) expire(key string, expireAt int64) bool {
 func (s *shard) ttl(key string) int64 {
 	s.RLock()
 	item, exists := s.items[key]
-
-	if !exists || item.IsExpired() {
+	if !exists {
+		s.RUnlock()
 		return -2
 	}
-
-	expireAt := item.ExpireAt
+	expireAt := atomic.LoadInt64(&item.ExpireAt)
 	s.RUnlock()
+
+	if expireAt > 0 && time.Now().UnixNano() > expireAt {
+		return -2
+	}
 	if expireAt == 0 {
 		return -1
 	}
-	remaining := item.ExpireAt - time.Now().UnixNano()
+	remaining := expireAt - time.Now().UnixNano()
 	if remaining <= 0 {
 		return -2
 	}
@@ -259,12 +270,18 @@ func (s *shard) appendVal(key, suffix string) (int, bool) {
 func (s *shard) strlen(key string) int {
 	s.RLock()
 	item, exists := s.items[key]
-	defer s.RUnlock()
-
-	if !exists || item.IsExpired() {
+	if !exists {
+		s.RUnlock()
 		return 0
 	}
-	return len(item.Value)
+	expireAt := atomic.LoadInt64(&item.ExpireAt)
+	vlen := len(item.Value)
+	s.RUnlock()
+
+	if expireAt > 0 && time.Now().UnixNano() > expireAt {
+		return 0
+	}
+	return vlen
 }
 
 // keys возвращает ключи в этом шарде, matching pattern.
@@ -289,19 +306,15 @@ func (s *shard) keys(pattern string) []string {
 	return result
 }
 
-// rename переименовывает ключ. Атомарно внутри одного шарда.
-// Для кросс-шардного rename используется Cache.Rename.
-func (s *shard) getItem(key string) (ItemSnapshot, bool) {
+// rename переименовывает ключ. Атомарно внутри одного шарда
+// Для кросс-шардного rename используется Cache.Rename
+func (s *shard) getItem(key string) (*Item, bool) {
 	s.RLock()
-	defer s.RUnlock()
 	item, exists := s.items[key]
-	
+	s.RUnlock()
 
 	if !exists || item.IsExpired() {
-		return ItemSnapshot{}, false
+		return nil, false
 	}
-	return ItemSnapshot{
-		Value: item.Value,
-		ExpireAt: item.ExpireAt,
-	}, true
+	return item, true
 }
