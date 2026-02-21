@@ -69,27 +69,38 @@ func (s *shard) set(key, value string, expireAt int64) bool {
 func (s *shard) get(key string) (string, bool) {
 	s.RLock()
 	item, exists := s.items[key]
-	s.RUnlock()
+	
 
 	if !exists {
+		s.RUnlock()
 		return "", false
 	}
 
 	if item.IsExpired() {
+		s.RUnlock()
+
+		// Тут я делаю upgrade до write lock для удаления
+
 		s.Lock()
 		if item, exists = s.items[key]; exists && item.IsExpired() {
 			delete(s.items, key)
 			if item.HeapIndex >= 0 {
 				heap.Remove(&s.pq, item.HeapIndex)
 			}
-			s.Unlock()
-			return "", false
+
+
+			
 		}
 		s.Unlock()
+		return "", false
 	}
 
+
+	value := item.Value // Копирайт под блоком
+	s.RUnlock()
+
 	atomic.StoreInt64(&item.LastAccess, nowCached())
-	return item.Value, true
+	return value, true
 }
 
 // del удаляет ключ из шарда. Возвращает true, если ключ был удалён.
