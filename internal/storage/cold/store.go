@@ -4,43 +4,22 @@ import (
 	"encoding/gob"
 	"os"
 	"path/filepath"
-	"sync"
 )
 
-// entry — одна запись на диске.
-type entry struct {
-	Key      string
-	Value    string
-	ExpireAt int64
-}
+/*
 
-// Store — файловое хранилище для холодных (старых) данных.
-// Данные хранятся в gob-файле c in-memory индексом.
-type Store struct {
-	mu    sync.RWMutex
-	dir   string
-	index map[string]entry // ключ → значение (в памяти, но дешево — только index)
-}
+	Тут методы:
+		Put,
+		Get,
+		PutBatch,
+		Delete,
+		Len,
+		Load
+		Flush,
+		FlushAll
 
-// New создаёт cold store в указанной директории.
-func New(dir string) (*Store, error) {
-	dir = filepath.Join(dir, "cold")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, err
-	}
+*/
 
-	s := &Store{
-		dir:   dir,
-		index: make(map[string]entry),
-	}
-
-	// Загружаем существующие данные
-	if err := s.load(); err != nil {
-		// Не фатально — просто начинаем с пустого
-	}
-
-	return s, nil
-}
 
 // Put сохраняет ключ в cold storage.
 func (s *Store) Put(key, value string, expireAt int64) {
@@ -85,12 +64,6 @@ func (s *Store) Len() int {
 	return len(s.index)
 }
 
-// Item — элемент для batch операций.
-type Item struct {
-	Key      string
-	Value    string
-	ExpireAt int64
-}
 
 // Flush сбрасывает index на диск (gob).
 func (s *Store) Flush() error {
@@ -115,6 +88,7 @@ func (s *Store) Flush() error {
 	return os.Rename(tmp, path)
 }
 
+
 // load загружает index с диска.
 func (s *Store) load() error {
 	path := filepath.Join(s.dir, "cold.gob")
@@ -127,6 +101,7 @@ func (s *Store) load() error {
 
 	return gob.NewDecoder(f).Decode(&s.index)
 }
+
 
 // FlushAll очищает весь cold store (RAM + disk).
 func (s *Store) FlushAll() {
