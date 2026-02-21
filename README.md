@@ -263,44 +263,6 @@ SET key value [EX seconds] [PX milliseconds] [NX] [XX]
 └────────────────────────────────────────────────────────────────────┘
 ```
 
-### Структура проекта
-
-```
-IMCS/
-├── cmd/imcs/
-│   └── main.go                  # Точка входа, флаги, graceful shutdown
-├── internal/
-│   ├── server/
-│   │   ├── server.go            # TCP-сервер, роутинг 22+ команд
-│   │   ├── resp.go              # RESP парсер + response builders
-│   │   ├── types.go             # Структуры данных сервера
-│   │   └── tcp_stress_test.go   # 8 hard тестов (17 test cases)
-│   ├── storage/
-│   │   ├── cache.go             # Ядро: New, Set, Get, Delete, Snapshot, Close
-│   │   ├── cache_ops.go         # Redis-операции: Exists, Expire, TTL, IncrBy...
-│   │   ├── eviction.go          # TTL expiry, cold eviction, LRU
-│   │   ├── shard.go             # Шард: map + priority queue + RWMutex
-│   │   ├── types.go             # Интерфейсы и структуры
-│   │   ├── item.go              # Item (ключ-значение + TTL + LastAccess)
-│   │   ├── clock.go             # Кешированные часы (~1ns вместо 25ns)
-│   │   ├── janitor/
-│   │   │   └── janitor.go       # Фоновая очистка (отдельный пакет)
-│   │   └── cold/
-│   │       └── store.go         # Дисковое хранилище (gob)
-│   ├── persistence/AOF/
-│   │   ├── types.go             # AOF структуры
-│   │   ├── write.go             # Фоновая запись + rewrite buffer
-│   │   ├── read.go              # CRC64 читалка + crash recovery
-│   │   ├── rewrite.go           # AOF Rewrite (компактность)
-│   │   ├── persister.go         # Адаптер Persistence интерфейса
-│   │   └── crash_test.go        # 5 crash/corruption тестов
-│   └── command/
-│       └── types.go             # Типы команд (legacy)
-├── Dockerfile                   # Multi-stage build (~15MB image)
-├── LICENSE                      # MIT License
-└── go.mod
-```
-
 ### Ключевые решения
 
 #### Шардирование (64 шарда)
@@ -357,9 +319,10 @@ Benchmarks were performed on the following hardware and software setup to ensure
 *   **Architecture:** x86_64
 
 ## Software
-*   **OS:** Linux Mint 22.3 (Zena)
-*   **Kernel:** 6.17.0-14-generic
-*   **Go Version:** go1.25.6 linux/amd64
+
+   **OS:** Linux Mint 22.3 (Zena)
+   **Kernel:** 6.17.0-14-generic
+   **Go Version:** go1.25.6 linux/amd64
 
 ## Конфигурация
 
