@@ -1,28 +1,17 @@
 package janitor
 
 import (
-	"imcs/internal/storage"
 	"time"
 )
 
-// Janitor — фоновый сборщик: TTL expiry, cold eviction, cold flush.
-type Janitor struct {
-	cache  *storage.Cache
-	stopCh chan struct{}
-}
+/*
+ 	Start запускает фоновые тикеры.
+ 	TTL expiry: каждую секунду (O(1) через heap).
+ 	Cold eviction: каждые 10 секунд (sample 16 ключей/шард).
+ 	Cold flush: каждые 30 секунд (gob на диск).
+	
+*/
 
-// New создаёт janitor.
-func New(cache *storage.Cache) *Janitor {
-	return &Janitor{
-		cache:  cache,
-		stopCh: make(chan struct{}),
-	}
-}
-
-// Start запускает фоновые тикеры.
-// TTL expiry: каждую секунду (O(1) через heap).
-// Cold eviction: каждые 10 секунд (sample 16 ключей/шард).
-// Cold flush: каждые 30 секунд (gob на диск).
 func (j *Janitor) Start() {
 	go j.run()
 }
@@ -43,7 +32,7 @@ func (j *Janitor) run() {
 	var flushCh <-chan time.Time
 
 	for {
-		// Динамическая инициализация flush ticker при появлении cold
+		// Динамическая инициализация flush ticker при появлении cold 
 		if j.cache.HasCold() && flushTicker == nil {
 			flushTicker = time.NewTicker(30 * time.Second)
 			flushCh = flushTicker.C
