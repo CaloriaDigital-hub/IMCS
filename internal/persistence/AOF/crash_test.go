@@ -64,7 +64,10 @@ func TestCrashRecoveryMB(t *testing.T) {
 	writeElapsed := time.Since(writeStart)
 	fmt.Printf("║  Write time:    %10v                       ║\n", writeElapsed.Round(time.Millisecond))
 
-	// Flush + crash (не Close)
+	// Имитация краша: останавливаем backgroundWriter, flush буфер
+	close(aof1.stopCh)
+	<-aof1.done
+
 	aof1.mu.Lock()
 	aof1.writer.Flush()
 	aof1.file.Sync()
@@ -521,12 +524,10 @@ func TestHeavyLoadThenCrash(t *testing.T) {
 	}
 
 	writeTime := time.Since(writeStart)
-	time.Sleep(200 * time.Millisecond)
 
-	aof1.mu.Lock()
-	aof1.writer.Flush()
-	aof1.file.Sync()
-	aof1.mu.Unlock()
+	// Корректно останавливаем AOF — Close() ждёт завершения backgroundWriter,
+	// делает Flush и Sync.
+	aof1.Close()
 	aof1 = nil
 
 	stat, _ := os.Stat(filepath.Join(dir, "journal.aof"))
