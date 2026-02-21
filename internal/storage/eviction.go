@@ -144,7 +144,7 @@ func (c *Cache) evictLRU() {
 }
 
 // flushWorker — горутина-worker для записи в cold storage.
-func (c *Cache) flushWorker(id int) {
+func (c *Cache) flushWorker(_ int) {
 	batch := make([]cold.Item, 0, 64)
 
 	for item := range c.flushCh {
