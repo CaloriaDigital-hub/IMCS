@@ -291,13 +291,17 @@ func (s *shard) keys(pattern string) []string {
 
 // rename переименовывает ключ. Атомарно внутри одного шарда.
 // Для кросс-шардного rename используется Cache.Rename.
-func (s *shard) getItem(key string) (*Item, bool) {
+func (s *shard) getItem(key string) (ItemSnapshot, bool) {
 	s.RLock()
+	defer s.RUnlock()
 	item, exists := s.items[key]
-	s.RUnlock()
+	
 
 	if !exists || item.IsExpired() {
-		return nil, false
+		return ItemSnapshot{}, false
 	}
-	return item, true
+	return ItemSnapshot{
+		Value: item.Value,
+		ExpireAt: item.ExpireAt,
+	}, true
 }

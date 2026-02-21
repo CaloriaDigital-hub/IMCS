@@ -78,6 +78,11 @@ type shard struct {
 	pq    priorityQueue
 }
 
+type ItemSnapshot struct {
+	Value 		string
+	ExpireAt 	int64
+}
+
 
 
 
