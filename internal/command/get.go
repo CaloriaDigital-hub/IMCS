@@ -1,6 +1,6 @@
 package command
 
-import "imcs/internal/storage"
+import "imcs/internal/storage/cache"
 
 // handleGet обрабатывает команду GET key.
 func handleGet(args []string, c *storage.Cache) []byte {

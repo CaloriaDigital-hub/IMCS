@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"imcs/internal/storage"
+	"imcs/internal/storage/cache"
 )
 
 type nullPersistence struct{}

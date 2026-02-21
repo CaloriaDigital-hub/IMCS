@@ -1,6 +1,6 @@
 package janitor
 
-import "imcs/internal/storage"
+import "imcs/internal/storage/cache"
 
 // New создаёт janitor.
 func New(cache *storage.Cache) *Janitor {

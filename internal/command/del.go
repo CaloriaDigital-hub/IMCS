@@ -1,6 +1,6 @@
 package command
 
-import "imcs/internal/storage"
+import "imcs/internal/storage/cache"
 
 // handleDel обрабатывает команду DEL key.
 func handleDel(args []string, c *storage.Cache) []byte {

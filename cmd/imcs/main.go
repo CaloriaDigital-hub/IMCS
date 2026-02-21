@@ -10,7 +10,7 @@ import (
 
 	"imcs/internal/persistence/AOF"
 	"imcs/internal/server"
-	"imcs/internal/storage"
+	"imcs/internal/storage/cache"
 	"imcs/internal/storage/janitor"
 )
 

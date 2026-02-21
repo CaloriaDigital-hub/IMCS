@@ -1,6 +1,6 @@
 package command
 
-import "imcs/internal/storage"
+import "imcs/internal/storage/cache"
 
 // CmdFunc — тип функции-обработчика команды.
 type CmdFunc func(args []string, c *storage.Cache) []byte
