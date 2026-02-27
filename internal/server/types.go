@@ -14,3 +14,7 @@ type Server struct {
 	listener net.Listener
 	stopCh   chan struct{}
 }
+
+// Option — функциональная опция сервера.
+type Option func(*Server)
+
