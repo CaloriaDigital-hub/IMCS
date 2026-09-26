@@ -24,11 +24,10 @@ func TestStress50K(t *testing.T) {
 	)
 
 	c := New(&mockPersistence{})
-	defer c.Close()
 
 	// Предзаполняем кеш 100К ключей
 	for i := 0; i < keySpace; i++ {
-		c.Set("key:"+strconv.Itoa(i), "val:"+strconv.Itoa(i), 0, false)
+		c.Set("key:"+strconv.Itoa(i), "val:"+strconv.Itoa(i), SetOptions{})
 	}
 
 	var (
@@ -66,7 +65,7 @@ func TestStress50K(t *testing.T) {
 
 				case roll < readPercent+writePercent: // 20% SET
 					ttl := time.Duration(rng.Intn(300)+1) * time.Second
-					err := c.Set(key, "updated:"+strconv.Itoa(userID), ttl, false)
+					_, err := c.Set(key, "updated:"+strconv.Itoa(userID), SetOptions{TTL: ttl})
 					totalSets.Add(1)
 					if err != nil {
 						totalSetErrs.Add(1)
@@ -128,7 +127,6 @@ func TestStressBurst(t *testing.T) {
 	)
 
 	c := New(&mockPersistence{})
-	defer c.Close()
 
 	var (
 		ready    sync.WaitGroup
@@ -153,7 +151,7 @@ func TestStressBurst(t *testing.T) {
 			go_bang.Wait() // все ждут сигнала
 
 			// SET
-			c.Set(key, val, 30*time.Second, false)
+			c.Set(key, val, SetOptions{TTL: 30 * time.Second})
 			setCount.Add(1)
 
 			// GET

@@ -1,179 +1,122 @@
 package storage
 
 import (
-	"container/heap"
+	"math"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
-
-	"imcs/internal/storage/cold"
 )
 
 const (
-	coldThreshold  = 5 * time.Minute  // данные старше 5 минут → на диск
-	flushDiskEvery = 30 * time.Second // сброс cold store на диск
-	flushWorkers   = 4                // кол-во горутин для выгрузки на диск
-	flushChanSize  = 1024             // буфер канала
+	expirePerShard = 256 // ключей за один проход по шарду
+	evictShards    = 4   // шардов в выборке LRU
+	evictSamples   = 5   // ключей с каждого шарда (как maxmemory-samples в Redis)
 )
 
-// HasCold возвращает true если cold storage инициализирован.
-func (c *Cache) HasCold() bool {
-	return c.cold != nil
-}
-
-// ExpireByTTL — O(1) per expired key. Использует min-heap.
-// Лимит: до 128 ключей за тик (чтобы не блокировать шарды надолго).
-func (c *Cache) ExpireByTTL() {
-	now := time.Now().UnixNano()
-	const maxPerShard = 128
-
-	for i := 0; i < shardCount; i++ {
-		s := c.shards[i]
-		s.Lock()
-
-		removed := 0
-		for s.pq.Len() > 0 && removed < maxPerShard {
-			top := s.pq[0]
-			if top.ExpireAt > now {
-				break
+// ExpireByTTL удаляет истёкшие ключи через min-heap (O(log n) на ключ).
+//
+// Шард держится под Lock не дольше expirePerShard удалений. Если хотя бы в
+// одном шарде остались истёкшие ключи, проход повторяется, пока не выйдет budget —
+// так скорость чистки подстраивается под поток истекающих ключей.
+// Возвращает число удалённых ключей.
+func (c *Cache) ExpireByTTL(budget time.Duration) int {
+	start := time.Now()
+	total := 0
+	for {
+		more := false
+		for _, s := range c.shards {
+			now := time.Now().UnixNano()
+			s.Lock()
+			n := 0
+			for len(s.pq) > 0 && n < expirePerShard {
+				top := s.pq[0]
+				if top.ExpireAt > now {
+					break
+				}
+				s.remove(top)
+				n++
 			}
-			heap.Pop(&s.pq)
-			delete(s.items, top.Key)
-			c.totalKeys.Add(-1)
-			removed++
+			if n == expirePerShard {
+				more = true
+			}
+			s.Unlock()
+			total += n
 		}
-
-		s.Unlock()
+		if !more || time.Since(start) >= budget {
+			return total
+		}
 	}
 }
 
-// EvictCold — sample-based cold eviction.
-// Смотрим до 16 ключей в каждом шарде.
-// Если ключ не использовался > coldThreshold — выгружаем в cold storage.
-func (c *Cache) EvictCold() {
-	if c.cold == nil {
+// makeRoom освобождает место под новый ключ, если достигнут лимит maxKeys.
+// Вызывать без локов.
+func (c *Cache) makeRoom(key string) {
+	if c.maxKeys <= 0 || c.totalKeys.Load() < c.maxKeys {
 		return
 	}
-
-	now := time.Now().UnixNano()
-	coldDeadline := now - int64(coldThreshold)
-	const sampleSize = 16
-
-	for i := 0; i < shardCount; i++ {
-		s := c.shards[i]
-		s.Lock()
-
-		sampled := 0
-		for key, item := range s.items {
-			if sampled >= sampleSize {
-				break
-			}
-			sampled++
-
-			access := atomic.LoadInt64(&item.LastAccess)
-			if access < coldDeadline {
-				select {
-				case c.flushCh <- coldItem{
-					key:      key,
-					value:    item.Value,
-					expireAt: item.ExpireAt,
-				}:
-					delete(s.items, key)
-					if item.HeapIndex >= 0 {
-						heap.Remove(&s.pq, item.HeapIndex)
-					}
-					c.totalKeys.Add(-1)
-				default:
-					// канал полон — пропускаем
-				}
-			}
+	s := c.shardFor(key)
+	s.RLock()
+	_, exists := s.items[key]
+	s.RUnlock()
+	if exists {
+		return
+	}
+	for i := 0; i < 32 && c.totalKeys.Load() >= c.maxKeys; i++ {
+		if !c.evictOne() {
+			return
 		}
-
-		s.Unlock()
 	}
 }
 
-// FlushCold сбрасывает cold storage на диск.
-func (c *Cache) FlushCold() {
-	if c.cold != nil {
-		c.cold.Flush()
-	}
-}
-
-// evictLRU вытесняет один ключ с минимальным LastAccess.
-// Если cold storage включён — выгружает на диск вместо удаления.
-func (c *Cache) evictLRU() {
+// evictOne вытесняет один ключ (sampled LRU; истёкшие — в первую очередь).
+// Вытеснение пишется в журнал как DEL, иначе ключ вернётся после рестарта.
+func (c *Cache) evictOne() bool {
+	now := time.Now().UnixNano()
 	var (
-		victimKey   string
-		victimValue string
-		victimExp   int64
-		victimShard *shard
-		minAccess   int64 = 1<<63 - 1
+		victim    *Item
+		victimIdx int
+		minAccess int64 = math.MaxInt64
 	)
 
-	for i := 0; i < shardCount; i++ {
+	sample := func(i int) {
 		s := c.shards[i]
 		s.RLock()
-
-		sampled := 0
-		for _, item := range s.items {
-			access := atomic.LoadInt64(&item.LastAccess)
-			if access < minAccess {
-				minAccess = access
-				victimKey = item.Key
-				victimValue = item.Value
-				victimExp = item.ExpireAt
-				victimShard = s
+		n := 0
+		for _, it := range s.items {
+			access := atomic.LoadInt64(&it.LastAccess)
+			if it.expired(now) {
+				access = math.MinInt64
 			}
-			sampled++
-			if sampled >= 5 {
+			if access < minAccess {
+				minAccess, victim, victimIdx = access, it, i
+			}
+			if n++; n >= evictSamples {
 				break
 			}
 		}
-
 		s.RUnlock()
 	}
 
-	if victimShard != nil {
-		if victimShard.del(victimKey) {
-			c.totalKeys.Add(-1)
-			if c.cold != nil {
-				c.cold.Put(victimKey, victimValue, victimExp)
-			}
-		}
+	start := rand.IntN(shardCount)
+	for i := 0; i < evictShards; i++ {
+		sample((start + i*(shardCount/evictShards)) % shardCount)
 	}
-}
-
-// flushWorker — горутина-worker для записи в cold storage.
-func (c *Cache) flushWorker(_ int) {
-	batch := make([]cold.Item, 0, 64)
-
-	for item := range c.flushCh {
-		batch = append(batch, cold.Item{
-			Key:      item.key,
-			Value:    item.value,
-			ExpireAt: item.expireAt,
-		})
-
-		// Drain: собираем пачку
-		drained := true
-		for drained && len(batch) < 64 {
-			select {
-			case it, ok := <-c.flushCh:
-				if !ok {
-					drained = false
-					break
-				}
-				batch = append(batch, cold.Item{
-					Key:      it.key,
-					Value:    it.value,
-					ExpireAt: it.expireAt,
-				})
-			default:
-				drained = false
-			}
-		}
-
-		c.cold.PutBatch(batch)
-		batch = batch[:0]
+	// Ключи могут быть сосредоточены в нескольких шардах — добираем полным обходом.
+	for i := 0; victim == nil && i < shardCount; i++ {
+		sample(i)
 	}
+	if victim == nil {
+		return false
+	}
+
+	s := c.shards[victimIdx]
+	s.Lock()
+	defer s.Unlock()
+	if s.items[victim.Key] != victim {
+		return true // уже удалён или заменён — место, возможно, освободилось
+	}
+	s.remove(victim)
+	// Если журнал отвалился, следующая запись всё равно получит ErrPersistence.
+	_ = c.log(logDel, victim.Key, "", 0)
+	return true
 }

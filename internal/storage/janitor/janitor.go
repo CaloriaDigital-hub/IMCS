@@ -1,51 +1,47 @@
 package janitor
 
-import (
-	"time"
-)
+import "time"
 
 /*
- 	Start запускает фоновые тикеры.
- 	TTL expiry: каждую секунду (O(1) через heap).
- 	Cold eviction: каждые 10 секунд (sample 16 ключей/шард).
- 	Cold flush: каждые 30 секунд (gob на диск).
-	
+	Каждые tickInterval janitor удаляет истёкшие ключи. Один шард держится
+	под Lock не дольше 256 удалений, а весь тик ограничен tickBudget —
+	так клиентские запросы не стопорятся даже на 2 vCPU, а при потоке
+	истекающих ключей тик сам растягивается до бюджета.
 */
 
+const (
+	tickInterval = 100 * time.Millisecond
+	tickBudget   = 25 * time.Millisecond
+)
+
+// Start запускает фоновую горутину. Повторный вызов — no-op.
 func (j *Janitor) Start() {
-	go j.run()
+	j.start.Do(func() {
+		j.started = true
+		go j.run()
+	})
 }
 
-// Stop останавливает janitor.
+// Stop останавливает janitor и ждёт завершения текущего тика.
 func (j *Janitor) Stop() {
-	close(j.stopCh)
+	j.stop.Do(func() {
+		close(j.stopCh)
+		if j.started {
+			<-j.done
+		}
+	})
 }
 
 func (j *Janitor) run() {
-	ttlTicker := time.NewTicker(1 * time.Second)
-	defer ttlTicker.Stop()
+	defer close(j.done)
 
-	coldTicker := time.NewTicker(10 * time.Second)
-	defer coldTicker.Stop()
-
-	var flushTicker *time.Ticker
-	var flushCh <-chan time.Time
+	ticker := time.NewTicker(tickInterval)
+	defer ticker.Stop()
 
 	for {
-		// Динамическая инициализация flush ticker при появлении cold 
-		if j.cache.HasCold() && flushTicker == nil {
-			flushTicker = time.NewTicker(30 * time.Second)
-			flushCh = flushTicker.C
-			defer flushTicker.Stop()
-		}
-
 		select {
-		case <-ttlTicker.C:
-			j.cache.ExpireByTTL()
-		case <-coldTicker.C:
-			j.cache.EvictCold()
-		case <-flushCh:
-			j.cache.FlushCold()
+		case <-ticker.C:
+			j.cache.ExpireByTTL(tickBudget)
 		case <-j.stopCh:
 			return
 		}

@@ -1,19 +1,17 @@
 package storage
 
-import (
-	"sync/atomic"
-	"time"
-)
-
-const staleThreshold = 7 * 24 * time.Hour // 1 неделя
-
-// IsExpired проверяет, истёк ли TTL элемента. Thread-safe (atomic).
-func (i *Item) IsExpired() bool {
-	expireAt := atomic.LoadInt64(&i.ExpireAt)
-	return expireAt > 0 && time.Now().UnixNano() > expireAt
+// Item — элемент кеша.
+//
+// Key, Value, ExpireAt, HeapIndex меняются только под Lock шарда.
+// LastAccess пишется атомарно под RLock (в Get).
+type Item struct {
+	Key        string
+	Value      string
+	ExpireAt   int64 // unix ns, 0 = без TTL
+	LastAccess int64 // unix ns, atomic
+	HeapIndex  int   // позиция в heap, -1 если TTL нет
 }
 
-// IsStale проверяет, не использовался ли элемент больше недели.
-func (i *Item) IsStale() bool {
-	return time.Now().UnixNano()-atomic.LoadInt64(&i.LastAccess) > int64(staleThreshold)
+func (i *Item) expired(now int64) bool {
+	return i.ExpireAt > 0 && i.ExpireAt <= now
 }

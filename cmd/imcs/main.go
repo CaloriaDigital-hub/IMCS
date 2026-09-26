@@ -8,84 +8,58 @@ import (
 	"syscall"
 	"time"
 
-	"imcs/internal/persistence/AOF"
-	"imcs/internal/server"
-	"imcs/internal/storage/cache"
-	"imcs/internal/storage/janitor"
+	imcs "github.com/CaloriaDigital-hub/IMCS"
 )
 
 func main() {
-	port := flag.String("port", ":6380", "TCP port to listen on")
-	dir := flag.String("dir", "./cache-files", "Directory for AOF journal")
-	auth := flag.String("auth", "", "Password for AUTH (empty = no auth)")
+	addr := flag.String("port", ":6380", "address to listen on (host:port or :port)")
+	dir := flag.String("dir", "./cache-files", "directory for the AOF journal")
+	auth := flag.String("auth", "", "password for AUTH (or env IMCS_PASSWORD; empty = no auth)")
+	maxKeys := flag.Int64("maxkeys", 0, "max number of keys, LRU eviction above it (0 = unlimited)")
+	maxClients := flag.Int("maxclients", 10000, "max simultaneous client connections")
+	idle := flag.Duration("timeout", 0, "close idle client connections after this duration (0 = never)")
+	protected := flag.Bool("protected-mode", true, "without a password, accept only loopback clients")
+	repair := flag.Bool("aof-repair", false, "truncate the journal at a corrupt record in the middle (data after it is lost)")
 	flag.Parse()
 
-	// Создаём AOF-персистер
-	persister, err := AOF.NewPersister(*dir)
-	if err != nil {
-		log.Fatal("cannot open AOF:", err)
+	password := *auth
+	if password == "" {
+		// Пароль из окружения не виден в `ps`.
+		password = os.Getenv("IMCS_PASSWORD")
 	}
 
-	// Создаём шардированный кеш
-	cache := storage.New(persister)
-
-	// Инициализируем cold storage
-	if err := cache.InitColdStorage(*dir); err != nil {
-		log.Println("warning: cold storage init error:", err)
-	}
-
-	// Запускаем janitor (TTL expiry + cold eviction + cold flush)
-	j := janitor.New(cache)
-	j.Start()
-
-	// Восстанавливаем данные из AOF с CRC64 проверкой
-	result, err := persister.Read(func(cmd, key, value string, expire int64) {
-		switch cmd {
-		case "SET":
-			if expire > 0 && expire < time.Now().UnixNano() {
-				return
-			}
-			var ttl time.Duration
-			if expire > 0 {
-				ttl = time.Duration(expire-time.Now().UnixNano()) * time.Nanosecond
-			}
-			cache.Set(key, value, ttl, false)
-		case "DEL":
-			cache.Delete(key)
-		}
+	db, err := imcs.OpenWithOptions(*dir, imcs.Options{
+		MaxKeys:              *maxKeys,
+		Password:             password,
+		MaxClients:           *maxClients,
+		IdleTimeout:          *idle,
+		DisableProtectedMode: !*protected,
+		RepairAOF:            *repair,
 	})
 	if err != nil {
-		log.Println("warning: AOF restore error:", err)
-	}
-	if result != nil {
-		log.Printf("AOF: loaded %d entries", result.ValidEntries)
-		if result.Truncated {
-			log.Printf("AOF: truncated at offset %d (%d corrupt entries discarded)",
-				result.TruncatedAt, result.CorruptEntries)
-		}
+		log.Fatal(err)
 	}
 
-	// Создаём сервер с опциональным AUTH
-	var opts []server.Option
-	if *auth != "" {
-		opts = append(opts, server.WithAuth(*auth))
-	}
-	srv := server.New(*port, cache, opts...)
+	errCh := make(chan error, 1)
+	go func() { errCh <- db.ListenAndServe(*addr) }()
 
-	// Graceful shutdown: перехватываем SIGINT/SIGTERM
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		<-sigCh
-		log.Println("Shutting down gracefully...")
-		srv.Shutdown()
-		j.Stop()
-		cache.Close()
-		persister.Close()
-		log.Println("Bye!")
-		os.Exit(0)
-	}()
+	exitCode := 0
+	select {
+	case sig := <-sigCh:
+		log.Printf("received %v, shutting down...", sig)
+	case err := <-errCh:
+		log.Printf("server error: %v", err)
+		exitCode = 1
+	}
 
-	log.Fatal(srv.Listen())
+	start := time.Now()
+	if err := db.Close(); err != nil {
+		log.Printf("close error: %v", err)
+		exitCode = 1
+	}
+	log.Printf("stopped in %v", time.Since(start).Round(time.Millisecond))
+	os.Exit(exitCode)
 }

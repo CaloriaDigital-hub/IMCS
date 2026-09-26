@@ -1,5 +1,6 @@
-# Binary
-imcs
+# Binary (только в корне — без слеша игнорировался бы и каталог cmd/imcs/)
+/imcs
+/imcs.exe
 # Data files
 cache-files/
 

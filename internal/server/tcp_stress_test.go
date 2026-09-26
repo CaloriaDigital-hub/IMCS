@@ -2,6 +2,8 @@ package server
 
 import (
 	"bufio"
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -12,51 +14,37 @@ import (
 	"testing"
 	"time"
 
-	"imcs/internal/storage/cache"
+	"github.com/CaloriaDigital-hub/IMCS/internal/storage/cache"
 )
 
-type nullPersistence struct{}
+// ErrServerReply — сервер вернул "-ERR ...". Соединение живое, вызывающая
+// сторона может продолжать работу на том же коннекте.
+// IO/parse ошибки возвращаются отдельно (без этого wrap'а) — на них коннект мёртв.
+var ErrServerReply = errors.New("server reply error")
 
-func (n *nullPersistence) Write(cmd, key, value string, d time.Duration) error { return nil }
+func startTestServer(t *testing.T, opts ...Option) (string, *storage.Cache) {
+	t.Helper()
+	cache := storage.New(nil)
+	addr, _ := startServerWith(t, cache, opts...)
+	return addr, cache
+}
 
-func startTestServer(t *testing.T) (string, *storage.Cache) {
+func startServerWith(t *testing.T, cache *storage.Cache, opts ...Option) (string, *Server) {
 	t.Helper()
 
-	cache := storage.New(&nullPersistence{})
-	srv := New("127.0.0.1:0", cache)
-
+	srv := New("127.0.0.1:0", cache, opts...)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr := ln.Addr().String()
-	srv.listener = ln
-
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			go srv.handleConnection(conn)
-		}
-	}()
+	go srv.Serve(ln)
 
 	t.Cleanup(func() {
-		ln.Close()
-		cache.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
 	})
-
-	for i := 0; i < 10; i++ {
-		conn, err := net.Dial("tcp", addr)
-		if err == nil {
-			conn.Close()
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	return addr, cache
+	return ln.Addr().String(), srv
 }
 
 // readRESPReply читает один RESP-ответ.
@@ -75,7 +63,7 @@ func readRESPReply(reader *bufio.Reader) (string, error) {
 	case '+':
 		return line[1:], nil
 	case '-':
-		return line, nil
+		return line, fmt.Errorf("%w: %s", ErrServerReply, line[1:])
 	case ':':
 		return line[1:], nil
 	case '$':
@@ -180,7 +168,10 @@ func TestRESPProtocol(t *testing.T) {
 		{"MSET mk1 mv1 mk2 mv2 mk3 mv3\r\n", "OK"},
 		{"MGET mk1 mk2 mk3 mkX\r\n", "[mv1, mv2, mv3, (nil)]"},
 		{"SELECT 0\r\n", "OK"},
-		{"SELECT 1\r\n", "OK"},
+		{"SELECT 1\r\n", "-ERR DB index is out of range"},
+		{"TTL\r\n", "-ERR wrong number of arguments for 'ttl' command"},
+		{"SET q \"hello world\"\r\n", "OK"},
+		{"GET q\r\n", "hello world"},
 	}
 
 	fmt.Println("╔══════════════════════════════════════════════════╗")
@@ -191,9 +182,8 @@ func TestRESPProtocol(t *testing.T) {
 	for _, tt := range tests {
 		conn.Write([]byte(tt.cmd))
 		resp, err := readRESPReply(reader)
-		if err != nil {
-			t.Errorf("cmd=%q err=%v", tt.cmd, err)
-			continue
+		if err != nil && !errors.Is(err, ErrServerReply) {
+			t.Fatalf("cmd=%q err=%v", tt.cmd, err)
 		}
 
 		cmdName := strings.TrimRight(tt.cmd, "\r\n")
@@ -212,14 +202,14 @@ func TestRESPProtocol(t *testing.T) {
 }
 
 // ====================================================================
-// TEST 2: 5M ops стресс тест (1000 клиентов × 5000 ops)
+// TEST 2: 1M ops стресс тест (200 клиентов × 5000 ops)
 // ====================================================================
 
 func TestTCPStress50K(t *testing.T) {
 	addr, _ := startTestServer(t)
 
 	const (
-		clients      = 1000
+		clients      = 200 // ограничено лимитом одновременных TCP-соединений Windows (~200)
 		opsPerClient = 5000
 		keySpace     = 50000
 		readPct      = 70
@@ -516,7 +506,7 @@ func TestHardTTLExpiry(t *testing.T) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	// SET с TTL = 1 секунда
+	// SET с TTL = 500ms
 	conn.Write([]byte("SET ttl_test expire_me PX 500\r\n"))
 	resp, _ := readRESPReply(reader)
 	if resp != "OK" {
@@ -535,10 +525,17 @@ func TestHardTTLExpiry(t *testing.T) {
 	pttlStr, _ := readRESPReply(reader)
 	pttl, _ := strconv.Atoi(pttlStr)
 
-	// Ждём 600ms
-	time.Sleep(600 * time.Millisecond)
+	// Через 200ms ключ должен быть ЖИВ — иначе TTL слишком ранний.
+	// Без этой проверки сломанный TTL=50ms тоже "проходил" бы тест.
+	time.Sleep(200 * time.Millisecond)
+	conn.Write([]byte("GET ttl_test\r\n"))
+	respMid, _ := readRESPReply(reader)
+	if respMid != "expire_me" {
+		t.Errorf("TTL expired too early: at 200ms expected %q, got %q", "expire_me", respMid)
+	}
 
-	// Теперь ключ должен быть мёртв
+	// Ждём ещё 400ms (всего ~600ms с момента SET) — ключ должен быть мёртв
+	time.Sleep(400 * time.Millisecond)
 	conn.Write([]byte("GET ttl_test\r\n"))
 	resp, _ = readRESPReply(reader)
 
@@ -547,6 +544,7 @@ func TestHardTTLExpiry(t *testing.T) {
 	fmt.Println("╠══════════════════════════════════════════════════╣")
 	fmt.Printf("║  SET ttl_test PX 500                             ║\n")
 	fmt.Printf("║  Before: PTTL = %dms                            ║\n", pttl)
+	fmt.Printf("║  At 200ms: GET = %-10q                       ║\n", respMid)
 	fmt.Printf("║  After 600ms sleep:                              ║\n")
 
 	if resp == "(nil)" {
@@ -669,12 +667,18 @@ func TestHardMaxConnections(t *testing.T) {
 				failed.Add(1)
 				return
 			}
-			connected.Add(1)
 
-			// PING
+			// Считаем "подключён" только если сервер реально ответил на PING.
+			// До этого мы знаем только что TCP handshake прошёл.
 			conn.Write([]byte("PING\r\n"))
 			reader := bufio.NewReader(conn)
-			readRESPReply(reader)
+			resp, err := readRESPReply(reader)
+			if err != nil || resp != "PONG" {
+				failed.Add(1)
+				conn.Close()
+				return
+			}
+			connected.Add(1)
 
 			mu.Lock()
 			conns = append(conns, conn)
@@ -696,11 +700,19 @@ func TestHardMaxConnections(t *testing.T) {
 			defer opsWg.Done()
 			reader := bufio.NewReader(c)
 			key := fmt.Sprintf("conn:%d", id)
+
 			c.Write([]byte(fmt.Sprintf("SET %s alive\r\n", key)))
-			readRESPReply(reader)
+			if _, err := readRESPReply(reader); err != nil {
+				return
+			}
+			totalOps.Add(1)
+
 			c.Write([]byte(fmt.Sprintf("GET %s\r\n", key)))
-			readRESPReply(reader)
-			totalOps.Add(2)
+			resp, err := readRESPReply(reader)
+			if err != nil || resp != "alive" {
+				return
+			}
+			totalOps.Add(1)
 		}(i, conn)
 	}
 
@@ -747,13 +759,17 @@ func TestHardMixedChaos(t *testing.T) {
 	)
 
 	commands := []string{
-		"SET", "GET", "DEL", "INCR", "EXISTS",
+		"SET", "GET", "DEL", "EXISTS",
 		"APPEND", "STRLEN", "SETNX", "EXPIRE", "TTL",
 		"MSET", "MGET", "TYPE", "DBSIZE", "PING",
+		"INCR", // отдельный namespace, не пересекается со строковыми
 	}
 
-	var totalOps atomic.Int64
-	var totalErrs atomic.Int64
+	var (
+		totalOps    atomic.Int64
+		totalSrvErr atomic.Int64 // -ERR от сервера (логические — type mismatch и т.п.)
+		totalIOErr  atomic.Int64 // I/O / parse — соединение мёртвое
+	)
 	cmdCounts := make([]atomic.Int64, len(commands))
 
 	var wg sync.WaitGroup
@@ -767,7 +783,7 @@ func TestHardMixedChaos(t *testing.T) {
 
 			conn, err := net.Dial("tcp", addr)
 			if err != nil {
-				totalErrs.Add(1)
+				totalIOErr.Add(1)
 				return
 			}
 			defer conn.Close()
@@ -777,36 +793,41 @@ func TestHardMixedChaos(t *testing.T) {
 
 			for op := 0; op < ops; op++ {
 				cmdIdx := rng.Intn(len(commands))
-				key := fmt.Sprintf("chaos:%d", rng.Intn(1000))
+				// Строки и числа в разных namespace'ах:
+				// без этого INCR попадал бы по str-ключам и сервер легитимно
+				// возвращал бы -ERR (не число) — счётчик ошибок раздувался бы
+				// от ожидаемого поведения, а не от настоящих багов.
+				strKey := fmt.Sprintf("str:%d", rng.Intn(1000))
+				numKey := fmt.Sprintf("num:%d", rng.Intn(1000))
 
 				var cmd string
 				switch commands[cmdIdx] {
 				case "SET":
-					cmd = fmt.Sprintf("SET %s v%d\r\n", key, op)
+					cmd = fmt.Sprintf("SET %s v%d\r\n", strKey, op)
 				case "GET":
-					cmd = fmt.Sprintf("GET %s\r\n", key)
+					cmd = fmt.Sprintf("GET %s\r\n", strKey)
 				case "DEL":
-					cmd = fmt.Sprintf("DEL %s\r\n", key)
+					cmd = fmt.Sprintf("DEL %s\r\n", strKey)
 				case "INCR":
-					cmd = fmt.Sprintf("INCR %s\r\n", key)
+					cmd = fmt.Sprintf("INCR %s\r\n", numKey)
 				case "EXISTS":
-					cmd = fmt.Sprintf("EXISTS %s\r\n", key)
+					cmd = fmt.Sprintf("EXISTS %s\r\n", strKey)
 				case "APPEND":
-					cmd = fmt.Sprintf("APPEND %s x\r\n", key)
+					cmd = fmt.Sprintf("APPEND %s x\r\n", strKey)
 				case "STRLEN":
-					cmd = fmt.Sprintf("STRLEN %s\r\n", key)
+					cmd = fmt.Sprintf("STRLEN %s\r\n", strKey)
 				case "SETNX":
-					cmd = fmt.Sprintf("SETNX %s v%d\r\n", key, op)
+					cmd = fmt.Sprintf("SETNX %s v%d\r\n", strKey, op)
 				case "EXPIRE":
-					cmd = fmt.Sprintf("EXPIRE %s 300\r\n", key)
+					cmd = fmt.Sprintf("EXPIRE %s 300\r\n", strKey)
 				case "TTL":
-					cmd = fmt.Sprintf("TTL %s\r\n", key)
+					cmd = fmt.Sprintf("TTL %s\r\n", strKey)
 				case "MSET":
-					cmd = fmt.Sprintf("MSET %s v1 %s:b v2\r\n", key, key)
+					cmd = fmt.Sprintf("MSET %s v1 %s:b v2\r\n", strKey, strKey)
 				case "MGET":
-					cmd = fmt.Sprintf("MGET %s %s:b\r\n", key, key)
+					cmd = fmt.Sprintf("MGET %s %s:b\r\n", strKey, strKey)
 				case "TYPE":
-					cmd = fmt.Sprintf("TYPE %s\r\n", key)
+					cmd = fmt.Sprintf("TYPE %s\r\n", strKey)
 				case "DBSIZE":
 					cmd = "DBSIZE\r\n"
 				case "PING":
@@ -816,7 +837,15 @@ func TestHardMixedChaos(t *testing.T) {
 				conn.Write([]byte(cmd))
 				_, err := readRESPReply(reader)
 				if err != nil {
-					totalErrs.Add(1)
+					if errors.Is(err, ErrServerReply) {
+						// Логическая ошибка: считаем и продолжаем — коннект жив.
+						totalSrvErr.Add(1)
+						cmdCounts[cmdIdx].Add(1)
+						totalOps.Add(1)
+						continue
+					}
+					// I/O — соединение мёртвое, эту горутину гасим.
+					totalIOErr.Add(1)
 					return
 				}
 
@@ -830,7 +859,8 @@ func TestHardMixedChaos(t *testing.T) {
 	elapsed := time.Since(start)
 
 	total := totalOps.Load()
-	errs := totalErrs.Load()
+	srvErrs := totalSrvErr.Load()
+	ioErrs := totalIOErr.Load()
 
 	fmt.Println("╔══════════════════════════════════════════════════╗")
 	fmt.Println("║    HARD TEST: MIXED CHAOS (all commands)        ║")
@@ -839,7 +869,8 @@ func TestHardMixedChaos(t *testing.T) {
 	fmt.Printf("║  Total ops:     %10d                          ║\n", total)
 	fmt.Printf("║  Duration:      %10v                          ║\n", elapsed.Round(time.Millisecond))
 	fmt.Printf("║  Throughput:    %10d ops/sec                 ║\n", int64(float64(total)/elapsed.Seconds()))
-	fmt.Printf("║  Errors:        %10d                          ║\n", errs)
+	fmt.Printf("║  -ERR replies:  %10d                          ║\n", srvErrs)
+	fmt.Printf("║  I/O errors:    %10d                          ║\n", ioErrs)
 	fmt.Println("╠══════════════════════════════════════════════════╣")
 
 	for i, name := range commands {
@@ -847,13 +878,14 @@ func TestHardMixedChaos(t *testing.T) {
 		fmt.Printf("║    %-12s  %10d                          ║\n", name, cnt)
 	}
 
-	if errs == 0 {
-		fmt.Println("╠══════════════════════════════════════════════════╣")
-		fmt.Println("║  ✅ CHAOS: NO ERRORS — server is stable          ║")
+	fmt.Println("╠══════════════════════════════════════════════════╣")
+	if srvErrs == 0 && ioErrs == 0 {
+		fmt.Println("║  ✅ CHAOS: NO ERRORS — server is correct+stable  ║")
 	} else {
-		fmt.Println("╠══════════════════════════════════════════════════╣")
-		fmt.Printf("║  ❌ CHAOS: %d ERRORS                            ║\n", errs)
-		t.Errorf("Chaos test errors: %d", errs)
+		fmt.Printf("║  ❌ CHAOS: %d -ERR, %d I/O                      ║\n", srvErrs, ioErrs)
+		// При корректно изолированных namespace'ах -ERR быть не должно.
+		// Если есть — это реальный баг сервера (или регрессия в неймспейсах).
+		t.Errorf("chaos: %d -ERR replies, %d I/O errors", srvErrs, ioErrs)
 	}
 
 	fmt.Println("╚══════════════════════════════════════════════════╝")

@@ -1,358 +1,536 @@
 package server
 
 import (
-	storage "imcs/internal/storage/cache"
+	"errors"
+	"log"
+	"math"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	storage "github.com/CaloriaDigital-hub/IMCS/internal/storage/cache"
 )
 
-// executeCommand выполняет RESP-команду, возвращает RESP-ответ.
-func (s *Server) executeCommand(cmd string, args []string) []byte {
-	switch cmd {
-	// === String Commands ===
-	case "SET":
-		return s.cmdSET(args)
-	case "GET":
-		return s.cmdGET(args)
-	case "DEL":
-		return s.cmdDEL(args)
-	case "SETNX":
-		return s.cmdSETNX(args)
-	case "SETEX":
-		return s.cmdSETEX(args)
-	case "MGET":
-		return s.cmdMGET(args)
-	case "MSET":
-		return s.cmdMSET(args)
-	case "INCR":
-		return s.cmdINCR(args, 1)
-	case "DECR":
-		return s.cmdINCR(args, -1)
-	case "INCRBY":
-		return s.cmdINCRBY(args, false)
-	case "DECRBY":
-		return s.cmdINCRBY(args, true)
-	case "APPEND":
-		return s.cmdAPPEND(args)
-	case "STRLEN":
-		return s.cmdSTRLEN(args)
+// command — описание команды.
+// arity как в Redis (с учётом имени): N — ровно N аргументов, -N — не меньше N.
+type command struct {
+	arity  int
+	noAuth bool // доступна до AUTH
+	fn     func(s *Server, c *client, args []string) []byte
+}
 
-	// === Key Commands ===
-	case "EXISTS":
-		return s.cmdEXISTS(args)
-	case "EXPIRE":
-		return s.cmdEXPIRE(args, false)
-	case "PEXPIRE":
-		return s.cmdEXPIRE(args, true)
-	case "TTL":
-		return respInt(s.cache.GetTTL(args[0]))
-	case "PTTL":
-		return respInt(s.cache.GetPTTL(args[0]))
-	case "PERSIST":
-		return s.cmdPERSIST(args)
-	case "TYPE":
-		return s.cmdTYPE(args)
-	case "RENAME":
-		return s.cmdRENAME(args)
-	case "KEYS":
-		return s.cmdKEYS(args)
+var commands map[string]command
 
-	// === Server Commands ===
-	case "PING":
-		return s.cmdPING(args)
-	case "ECHO":
-		return s.cmdECHO(args)
-	case "DBSIZE":
-		return respInt(s.cache.CountKeys())
-	case "FLUSHDB", "FLUSHALL":
-		s.cache.FlushDB()
-		return respOK()
-	case "INFO":
-		return s.cmdINFO()
-	case "SELECT":
-		return respOK() // single DB — always OK
-	case "COMMAND":
-		return respOK()
-	case "CONFIG":
-		return s.cmdCONFIG(args)
-	case "CLIENT":
-		return respOK()
+func init() {
+	commands = map[string]command{
+		// Строки
+		"SET":    {-3, false, cmdSet},
+		"GET":    {2, false, cmdGet},
+		"DEL":    {-2, false, cmdDel},
+		"UNLINK": {-2, false, cmdDel},
+		"SETNX":  {3, false, cmdSetNX},
+		"SETEX":  {4, false, cmdSetEX},
+		"PSETEX": {4, false, cmdSetEX},
+		"MGET":   {-2, false, cmdMGet},
+		"MSET":   {-3, false, cmdMSet},
+		"INCR":   {2, false, cmdIncr},
+		"DECR":   {2, false, cmdIncr},
+		"INCRBY": {3, false, cmdIncr},
+		"DECRBY": {3, false, cmdIncr},
+		"APPEND": {3, false, cmdAppend},
+		"STRLEN": {2, false, cmdStrlen},
 
+		// Ключи
+		"EXISTS":  {-2, false, cmdExists},
+		"EXPIRE":  {3, false, cmdExpire},
+		"PEXPIRE": {3, false, cmdExpire},
+		"TTL":     {2, false, cmdTTL},
+		"PTTL":    {2, false, cmdTTL},
+		"PERSIST": {2, false, cmdPersist},
+		"TYPE":    {2, false, cmdType},
+		"RENAME":  {3, false, cmdRename},
+		"KEYS":    {2, false, cmdKeys},
+
+		// Сервер
+		"AUTH":         {-2, true, cmdAuth},
+		"QUIT":         {-1, true, cmdQuit},
+		"PING":         {-1, false, cmdPing},
+		"ECHO":         {2, false, cmdEcho},
+		"DBSIZE":       {1, false, cmdDBSize},
+		"FLUSHDB":      {-1, false, cmdFlush},
+		"FLUSHALL":     {-1, false, cmdFlush},
+		"INFO":         {-1, false, cmdInfo},
+		"SELECT":       {2, false, cmdSelect},
+		"COMMAND":      {-1, false, cmdCommand},
+		"CONFIG":       {-2, false, cmdConfig},
+		"CLIENT":       {-2, false, cmdClient},
+		"BGREWRITEAOF": {1, false, cmdBgRewrite},
+	}
+}
+
+func (s *Server) dispatch(c *client, args []string) []byte {
+	s.totalCmds.Add(1)
+
+	cmd, ok := commands[args[0]]
+	if !ok {
+		cmd, ok = commands[strings.ToUpper(args[0])]
+	}
+	if !c.authed && !(ok && cmd.noAuth) {
+		return respError("NOAUTH", "Authentication required.")
+	}
+	if !ok {
+		return respErr("unknown command '" + truncate(args[0], 64) + "'")
+	}
+	if (cmd.arity > 0 && len(args) != cmd.arity) || (cmd.arity < 0 && len(args) < -cmd.arity) {
+		return respErr("wrong number of arguments for '" + strings.ToLower(args[0]) + "' command")
+	}
+	return cmd.fn(s, c, args)
+}
+
+func truncate(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
+}
+
+// errReply переводит ошибку хранилища в ответ Redis.
+func errReply(err error) []byte {
+	switch {
+	case errors.Is(err, storage.ErrPersistence):
+		return respError("MISCONF", "Errors writing to the AOF file, write commands are disabled. Check the server logs.")
+	case errors.Is(err, storage.ErrNotInteger):
+		return respErr("value is not an integer or out of range")
+	case errors.Is(err, storage.ErrOverflow):
+		return respErr("increment or decrement would overflow")
+	case errors.Is(err, storage.ErrNoSuchKey):
+		return respErr("no such key")
+	case errors.Is(err, storage.ErrInvalidExpire):
+		return respErr("invalid expire time")
 	default:
-		return respErrorMsg("unknown command '" + cmd + "'")
+		return respErr(err.Error())
 	}
 }
 
-// === String Commands ===
+var (
+	errSyntax    = respErr("syntax error")
+	errNotInt    = respErr("value is not an integer or out of range")
+	errBadExpire = func(cmd string) []byte { return respErr("invalid expire time in '" + cmd + "' command") }
+)
 
-func (s *Server) cmdSET(args []string) []byte {
-	if len(args) < 2 {
-		return respErrorMsg("wrong number of arguments for 'set' command")
+// parseTTL разбирает положительный TTL в единицах unit с проверкой переполнения.
+func parseTTL(str string, unit time.Duration, cmd string) (time.Duration, []byte) {
+	n, err := strconv.ParseInt(str, 10, 64)
+	if err != nil {
+		return 0, errNotInt
 	}
+	if n <= 0 || n > math.MaxInt64/int64(unit) {
+		return 0, errBadExpire(cmd)
+	}
+	return time.Duration(n) * unit, nil
+}
 
-	key := args[0]
-	value := args[1]
-	var ttl time.Duration
-	var nx, xx bool
+// === Строки ===
 
-	for i := 2; i < len(args); i++ {
-		opt := strings.ToUpper(args[i])
-		switch opt {
+// SET key value [NX|XX] [EX seconds|PX milliseconds|KEEPTTL]
+func cmdSet(s *Server, c *client, args []string) []byte {
+	var opt storage.SetOptions
+	hasTTL := false
+	for i := 3; i < len(args); i++ {
+		switch strings.ToUpper(args[i]) {
 		case "NX":
-			nx = true
+			if opt.XX {
+				return errSyntax
+			}
+			opt.NX = true
 		case "XX":
-			xx = true
-		case "EX":
-			if i+1 >= len(args) {
-				return respErrorMsg("syntax error")
+			if opt.NX {
+				return errSyntax
+			}
+			opt.XX = true
+		case "KEEPTTL":
+			if hasTTL {
+				return errSyntax
+			}
+			opt.KeepTTL = true
+		case "EX", "PX":
+			if hasTTL || opt.KeepTTL || i+1 >= len(args) {
+				return errSyntax
+			}
+			unit := time.Second
+			if strings.EqualFold(args[i], "PX") {
+				unit = time.Millisecond
 			}
 			i++
-			secs, err := strconv.Atoi(args[i])
-			if err != nil {
-				return respErrorMsg("value is not an integer or out of range")
+			ttl, errResp := parseTTL(args[i], unit, "set")
+			if errResp != nil {
+				return errResp
 			}
-			ttl = time.Duration(secs) * time.Second
-		case "PX":
-			if i+1 >= len(args) {
-				return respErrorMsg("syntax error")
-			}
-			i++
-			ms, err := strconv.Atoi(args[i])
-			if err != nil {
-				return respErrorMsg("value is not an integer or out of range")
-			}
-			ttl = time.Duration(ms) * time.Millisecond
+			opt.TTL, hasTTL = ttl, true
 		default:
-			return respErrorMsg("syntax error")
+			return errSyntax
 		}
 	}
 
-	// XX = only set if key already exists
-	if xx {
-		if s.cache.Exists(key) == 0 {
-			return respNilBulk()
-		}
-	}
-
-	if nx {
-		if err := s.cache.Set(key, value, ttl, true); err == storage.ErrKeyExist {
-			return respNilBulk()
-		}
-	} else {
-		s.cache.Set(key, value, ttl, false)
-	}
-
-	return respOK()
-}
-
-func (s *Server) cmdGET(args []string) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'get' command")
-	}
-
-	value, found := s.cache.Get(args[0])
-	if !found {
-		return respNilBulk()
-	}
-
-	return respBulk(value)
-}
-
-func (s *Server) cmdDEL(args []string) []byte {
-	if len(args) < 1 {
-		return respErrorMsg("wrong number of arguments for 'del' command")
-	}
-
-	deleted := 0
-	for _, key := range args {
-		if s.cache.Exists(key) > 0 {
-			s.cache.Delete(key)
-			deleted++
-		}
-	}
-
-	return respInt(int64(deleted))
-}
-
-func (s *Server) cmdSETNX(args []string) []byte {
-	if len(args) != 2 {
-		return respErrorMsg("wrong number of arguments for 'setnx' command")
-	}
-	if err := s.cache.Set(args[0], args[1], 0, true); err == storage.ErrKeyExist {
-		return respInt(0)
-	}
-	return respInt(1)
-}
-
-func (s *Server) cmdSETEX(args []string) []byte {
-	if len(args) != 3 {
-		return respErrorMsg("wrong number of arguments for 'setex' command")
-	}
-	secs, err := strconv.Atoi(args[1])
-	if err != nil || secs <= 0 {
-		return respErrorMsg("invalid expire time in 'setex' command")
-	}
-	s.cache.Set(args[0], args[2], time.Duration(secs)*time.Second, false)
-	return respOK()
-}
-
-func (s *Server) cmdMGET(args []string) []byte {
-	if len(args) < 1 {
-		return respErrorMsg("wrong number of arguments for 'mget' command")
-	}
-	results := s.cache.MGet(args...)
-	return respArrayBulks(results)
-}
-
-func (s *Server) cmdMSET(args []string) []byte {
-	if len(args) < 2 || len(args)%2 != 0 {
-		return respErrorMsg("wrong number of arguments for 'mset' command")
-	}
-	s.cache.MSet(args...)
-	return respOK()
-}
-
-func (s *Server) cmdINCR(args []string, delta int64) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'incr' command")
-	}
-	result, err := s.cache.IncrBy(args[0], delta)
+	ok, err := s.cache.Set(args[1], args[2], opt)
 	if err != nil {
-		return respErrorMsg("value is not an integer or out of range")
+		return errReply(err)
 	}
-	return respInt(result)
+	if !ok {
+		return replyNilBulk
+	}
+	return replyOK
 }
 
-func (s *Server) cmdINCRBY(args []string, negate bool) []byte {
-	if len(args) != 2 {
-		return respErrorMsg("wrong number of arguments for 'incrby' command")
+func cmdGet(s *Server, c *client, args []string) []byte {
+	v, ok := s.cache.Get(args[1])
+	if !ok {
+		return replyNilBulk
 	}
-	delta, err := strconv.ParseInt(args[1], 10, 64)
+	return respBulk(v)
+}
+
+func cmdDel(s *Server, c *client, args []string) []byte {
+	n, err := s.cache.Delete(args[1:]...)
 	if err != nil {
-		return respErrorMsg("value is not an integer or out of range")
+		return errReply(err)
 	}
-	if negate {
+	return respInt(n)
+}
+
+func cmdSetNX(s *Server, c *client, args []string) []byte {
+	ok, err := s.cache.Set(args[1], args[2], storage.SetOptions{NX: true})
+	if err != nil {
+		return errReply(err)
+	}
+	if ok {
+		return replyOne
+	}
+	return replyZero
+}
+
+// SETEX key seconds value / PSETEX key milliseconds value
+func cmdSetEX(s *Server, c *client, args []string) []byte {
+	unit, name := time.Second, "setex"
+	if strings.EqualFold(args[0], "PSETEX") {
+		unit, name = time.Millisecond, "psetex"
+	}
+	ttl, errResp := parseTTL(args[2], unit, name)
+	if errResp != nil {
+		return errResp
+	}
+	if _, err := s.cache.Set(args[1], args[3], storage.SetOptions{TTL: ttl}); err != nil {
+		return errReply(err)
+	}
+	return replyOK
+}
+
+func cmdMGet(s *Server, c *client, args []string) []byte {
+	return respArrayResults(s.cache.MGet(args[1:]...))
+}
+
+func cmdMSet(s *Server, c *client, args []string) []byte {
+	if len(args)%2 != 1 {
+		return respErr("wrong number of arguments for 'mset' command")
+	}
+	if err := s.cache.MSet(args[1:]...); err != nil {
+		return errReply(err)
+	}
+	return replyOK
+}
+
+// INCR / DECR / INCRBY / DECRBY
+func cmdIncr(s *Server, c *client, args []string) []byte {
+	name := strings.ToUpper(args[0])
+	delta := int64(1)
+	if len(args) == 3 {
+		d, err := strconv.ParseInt(args[2], 10, 64)
+		if err != nil {
+			return errNotInt
+		}
+		delta = d
+	}
+	if name == "DECR" || name == "DECRBY" {
+		if delta == math.MinInt64 {
+			return respErr("decrement would overflow")
+		}
 		delta = -delta
 	}
-	result, err := s.cache.IncrBy(args[0], delta)
+	n, err := s.cache.IncrBy(args[1], delta)
 	if err != nil {
-		return respErrorMsg("value is not an integer or out of range")
+		return errReply(err)
 	}
-	return respInt(result)
+	return respInt(n)
 }
 
-func (s *Server) cmdAPPEND(args []string) []byte {
-	if len(args) != 2 {
-		return respErrorMsg("wrong number of arguments for 'append' command")
+func cmdAppend(s *Server, c *client, args []string) []byte {
+	n, err := s.cache.Append(args[1], args[2])
+	if err != nil {
+		return errReply(err)
 	}
-	length := s.cache.Append(args[0], args[1])
-	return respInt(int64(length))
+	return respInt(int64(n))
 }
 
-func (s *Server) cmdSTRLEN(args []string) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'strlen' command")
-	}
-	return respInt(int64(s.cache.Strlen(args[0])))
+func cmdStrlen(s *Server, c *client, args []string) []byte {
+	return respInt(int64(s.cache.Strlen(args[1])))
 }
 
-// === Key Commands ===
+// === Ключи ===
 
-func (s *Server) cmdEXISTS(args []string) []byte {
-	if len(args) < 1 {
-		return respErrorMsg("wrong number of arguments for 'exists' command")
-	}
-	return respInt(s.cache.Exists(args...))
+func cmdExists(s *Server, c *client, args []string) []byte {
+	return respInt(s.cache.Exists(args[1:]...))
 }
 
-func (s *Server) cmdEXPIRE(args []string, isMs bool) []byte {
-	if len(args) != 2 {
-		return respErrorMsg("wrong number of arguments for 'expire' command")
+// EXPIRE key seconds / PEXPIRE key milliseconds. Неположительный TTL удаляет ключ.
+func cmdExpire(s *Server, c *client, args []string) []byte {
+	unit := time.Second
+	if strings.EqualFold(args[0], "PEXPIRE") {
+		unit = time.Millisecond
 	}
+	n, err := strconv.ParseInt(args[2], 10, 64)
+	if err != nil {
+		return errNotInt
+	}
+	if n > math.MaxInt64/int64(unit) {
+		return errBadExpire(strings.ToLower(args[0]))
+	}
+	ok, err := s.cache.Expire(args[1], time.Duration(n)*unit)
+	if err != nil {
+		return errReply(err)
+	}
+	if ok {
+		return replyOne
+	}
+	return replyZero
+}
+
+func cmdTTL(s *Server, c *client, args []string) []byte {
+	if strings.EqualFold(args[0], "PTTL") {
+		return respInt(s.cache.GetPTTL(args[1]))
+	}
+	return respInt(s.cache.GetTTL(args[1]))
+}
+
+func cmdPersist(s *Server, c *client, args []string) []byte {
+	ok, err := s.cache.Persist(args[1])
+	if err != nil {
+		return errReply(err)
+	}
+	if ok {
+		return replyOne
+	}
+	return replyZero
+}
+
+func cmdType(s *Server, c *client, args []string) []byte {
+	return respSimple(s.cache.Type(args[1]))
+}
+
+func cmdRename(s *Server, c *client, args []string) []byte {
+	if err := s.cache.Rename(args[1], args[2]); err != nil {
+		return errReply(err)
+	}
+	return replyOK
+}
+
+func cmdKeys(s *Server, c *client, args []string) []byte {
+	return respArrayStrings(s.cache.Keys(args[1]))
+}
+
+// === Сервер ===
+
+// AUTH password | AUTH default password
+func cmdAuth(s *Server, c *client, args []string) []byte {
+	if s.password == "" {
+		return respErr("AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?")
+	}
+	var pass string
+	switch len(args) {
+	case 2:
+		pass = args[1]
+	case 3:
+		if args[1] != "default" {
+			return respError("WRONGPASS", "invalid username-password pair or user is disabled.")
+		}
+		pass = args[2]
+	default:
+		return errSyntax
+	}
+	if !s.checkPassword(pass) {
+		return respError("WRONGPASS", "invalid username-password pair or user is disabled.")
+	}
+	c.authed = true
+	return replyOK
+}
+
+func cmdQuit(s *Server, c *client, args []string) []byte {
+	c.quit = true
+	return replyOK
+}
+
+func cmdPing(s *Server, c *client, args []string) []byte {
+	switch len(args) {
+	case 1:
+		return replyPong
+	case 2:
+		return respBulk(args[1])
+	default:
+		return respErr("wrong number of arguments for 'ping' command")
+	}
+}
+
+func cmdEcho(s *Server, c *client, args []string) []byte {
+	return respBulk(args[1])
+}
+
+func cmdDBSize(s *Server, c *client, args []string) []byte {
+	return respInt(s.cache.CountKeys())
+}
+
+// FLUSHDB / FLUSHALL [ASYNC|SYNC] — база одна, обе команды очищают всё.
+func cmdFlush(s *Server, c *client, args []string) []byte {
+	if len(args) > 2 {
+		return errSyntax
+	}
+	if len(args) == 2 {
+		if m := strings.ToUpper(args[1]); m != "ASYNC" && m != "SYNC" {
+			return errSyntax
+		}
+	}
+	if err := s.cache.FlushAll(); err != nil {
+		return errReply(err)
+	}
+	return replyOK
+}
+
+// SELECT 0 — поддерживается только одна база. Остальные индексы — ошибка,
+// а не молчаливая запись в ту же базу.
+func cmdSelect(s *Server, c *client, args []string) []byte {
 	n, err := strconv.Atoi(args[1])
 	if err != nil {
-		return respErrorMsg("value is not an integer or out of range")
+		return errNotInt
 	}
-	var ttl time.Duration
-	if isMs {
-		ttl = time.Duration(n) * time.Millisecond
+	if n != 0 {
+		return respErr("DB index is out of range")
+	}
+	return replyOK
+}
+
+func cmdCommand(s *Server, c *client, args []string) []byte {
+	if len(args) >= 2 && strings.EqualFold(args[1], "COUNT") {
+		return respInt(int64(len(commands)))
+	}
+	return replyEmpty
+}
+
+func cmdConfig(s *Server, c *client, args []string) []byte {
+	switch strings.ToUpper(args[1]) {
+	case "GET":
+		return replyEmpty
+	case "RESETSTAT":
+		return replyOK
+	default:
+		return respErr("CONFIG " + strings.ToUpper(args[1]) + " is not supported")
+	}
+}
+
+func cmdClient(s *Server, c *client, args []string) []byte {
+	switch strings.ToUpper(args[1]) {
+	case "SETNAME", "SETINFO", "NO-EVICT", "NO-TOUCH":
+		return replyOK
+	case "GETNAME":
+		return replyNilBulk
+	case "ID":
+		return respInt(0)
+	default:
+		return respErr("CLIENT " + strings.ToUpper(args[1]) + " is not supported")
+	}
+}
+
+func cmdBgRewrite(s *Server, c *client, args []string) []byte {
+	if s.rewrite == nil {
+		return respErr("AOF is not enabled")
+	}
+	if s.aof != nil && s.aof.RewriteRunning() {
+		return respErr("Background append only file rewriting already in progress")
+	}
+	go func() {
+		if err := s.rewrite(); err != nil {
+			log.Printf("BGREWRITEAOF failed: %v", err)
+		}
+	}()
+	return respSimple("Background append only file rewriting started")
+}
+
+func cmdInfo(s *Server, c *client, args []string) []byte {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	var b strings.Builder
+	line := func(k string, v any) {
+		b.WriteString(k)
+		b.WriteByte(':')
+		switch x := v.(type) {
+		case string:
+			b.WriteString(x)
+		case int64:
+			b.WriteString(strconv.FormatInt(x, 10))
+		case int:
+			b.WriteString(strconv.Itoa(x))
+		case uint64:
+			b.WriteString(strconv.FormatUint(x, 10))
+		}
+		b.WriteString("\r\n")
+	}
+
+	b.WriteString("# Server\r\n")
+	line("imcs_version", Version)
+	line("process_id", os.Getpid())
+	line("tcp_port", portOf(s.addr))
+	line("uptime_in_seconds", int64(time.Since(s.startedAt).Seconds()))
+	b.WriteString("\r\n# Clients\r\n")
+	line("connected_clients", s.ConnectedClients())
+	line("maxclients", s.maxClients)
+	b.WriteString("\r\n# Memory\r\n")
+	line("used_memory", ms.HeapAlloc)
+	line("used_memory_rss", ms.Sys)
+	b.WriteString("\r\n# Persistence\r\n")
+	line("loading", 0)
+	if s.aof != nil {
+		status := "ok"
+		if s.aof.Err() != nil {
+			status = "err"
+		}
+		rewriting := 0
+		if s.aof.RewriteRunning() {
+			rewriting = 1
+		}
+		line("aof_enabled", 1)
+		line("aof_rewrite_in_progress", rewriting)
+		line("aof_last_write_status", status)
+		line("aof_current_size", s.aof.Size())
 	} else {
-		ttl = time.Duration(n) * time.Second
+		line("aof_enabled", 0)
 	}
-	if s.cache.Expire(args[0], ttl) {
-		return respInt(1)
+	b.WriteString("\r\n# Stats\r\n")
+	line("total_connections_received", s.totalConns.Load())
+	line("total_commands_processed", s.totalCmds.Load())
+	b.WriteString("\r\n# Keyspace\r\n")
+	if keys := s.cache.CountKeys(); keys > 0 {
+		b.WriteString("db0:keys=" + strconv.FormatInt(keys, 10) +
+			",expires=" + strconv.FormatInt(s.cache.CountExpires(), 10) + ",avg_ttl=0\r\n")
 	}
-	return respInt(0)
+	return respBulk(b.String())
 }
 
-func (s *Server) cmdPERSIST(args []string) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'persist' command")
-	}
-	if s.cache.Persist(args[0]) {
-		return respInt(1)
-	}
-	return respInt(0)
-}
+// Version — версия сервера (INFO imcs_version).
+var Version = "1.1.0"
 
-func (s *Server) cmdTYPE(args []string) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'type' command")
+func portOf(addr string) string {
+	if i := strings.LastIndexByte(addr, ':'); i >= 0 {
+		return addr[i+1:]
 	}
-	return respSimple(s.cache.Type(args[0]))
-}
-
-func (s *Server) cmdRENAME(args []string) []byte {
-	if len(args) != 2 {
-		return respErrorMsg("wrong number of arguments for 'rename' command")
-	}
-	if !s.cache.Rename(args[0], args[1]) {
-		return respErrorMsg("no such key")
-	}
-	return respOK()
-}
-
-func (s *Server) cmdKEYS(args []string) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'keys' command")
-	}
-	keys := s.cache.Keys(args[0])
-	return respArrayStrings(keys)
-}
-
-// === Server Commands ===
-
-func (s *Server) cmdPING(args []string) []byte {
-	if len(args) > 0 {
-		return respBulk(args[0])
-	}
-	return respSimple("PONG")
-}
-
-func (s *Server) cmdECHO(args []string) []byte {
-	if len(args) != 1 {
-		return respErrorMsg("wrong number of arguments for 'echo' command")
-	}
-	return respBulk(args[0])
-}
-
-func (s *Server) cmdINFO() []byte {
-	keys := s.cache.CountKeys()
-	info := "# Server\r\n" +
-		"imcs_version:1.0.0\r\n" +
-		"resp_protocol:2\r\n" +
-		"tcp_port:" + strings.TrimPrefix(s.addr, ":") + "\r\n" +
-		"# Clients\r\n" +
-		"# Keyspace\r\n" +
-		"db0:keys=" + strconv.FormatInt(keys, 10) + ",expires=0\r\n"
-	return respBulk(info)
-}
-
-func (s *Server) cmdCONFIG(args []string) []byte {
-	if len(args) >= 1 && strings.ToUpper(args[0]) == "SET" {
-		return respOK()
-	}
-	// CONFIG GET — вернём пустой array
-	return respArrayStrings(nil)
+	return addr
 }

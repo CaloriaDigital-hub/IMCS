@@ -1,496 +1,183 @@
 # IMCS — In-Memory Cache Server
 
-<p align="center">
-  <strong>Легковесный Redis-совместимый кеш-сервер на Go</strong><br>
-  <em>Нулевые зависимости · RESP протокол · AOF persistence · 1.2M ops/sec</em>
-</p>
-
-<p align="center">
-  <a href="#быстрый-старт">Быстрый старт</a> ·
-  <a href="#команды">Команды</a> ·
-  <a href="#архитектура">Архитектура</a> ·
-  <a href="#производительность">Производительность</a> ·
-  <a href="#docker">Docker</a> ·
-  <a href="#сравнение-с-redis">vs Redis</a> ·
-  <a href="#лицензия">Лицензия</a>
-</p>
-
----
-
-## Что такое IMCS
-
-IMCS — это высокопроизводительный in-memory кеш-сервер, полностью совместимый с протоколом RESP (Redis Serialization Protocol). Работает с любым Redis-клиентом: `redis-cli`, `go-redis`, `ioredis`, `Jedis`, `redis-py` и другими.
-
-**Основные возможности:**
-
-- 🔌 **RESP протокол** — подключайтесь через любой Redis SDK
-- 💾 **AOF persistence** — данные не теряются при перезапуске
-- 🔒 **CRC64 checksums** — защита от повреждения журнала
-- ♻️ **AOF Rewrite** — автоматическая компактность журнала
-- 🧊 **Cold storage** — выгрузка неактивных данных на диск
-- ⚡ **64 шарда** — минимальный contention при конкурентном доступе
-- 🗑️ **Janitor** — фоновая очистка TTL через min-heap (O(1))
-- 🔐 **Аутентификация** — опциональный пароль через `AUTH`
-- 🛑 **Graceful shutdown** — корректное завершение по SIGINT/SIGTERM
-- 📦 **0 зависимостей** — только стандартная библиотека Go
+Легковесный кеш на Go со строковыми ключами: RESP2-сервер (работает с `redis-cli`
+и Redis-клиентами) или встраиваемая библиотека. Персистентность — AOF-журнал.
+Без внешних зависимостей.
 
 ---
 
 ## Быстрый старт
 
-### Установка из исходников
-
 ```bash
 git clone https://github.com/CaloriaDigital-hub/IMCS.git
 cd IMCS
 go build -o imcs ./cmd/imcs/
+
+./imcs                                   # :6380, данные в ./cache-files
+IMCS_PASSWORD=secret ./imcs -port :6379  # с паролем
 ```
-
-### Запуск
-
-```bash
-# Стандартный запуск (порт 6380)
-./imcs
-
-# С паролем
-./imcs -auth mysecretpassword
-
-# Кастомный порт и директория данных
-./imcs -port :6379 -dir /var/lib/imcs
-```
-
-### Подключение из Go-кода (без сети — главная фишка!)
-
-```go
-import "imcs"
-
-func main() {
-    // Одна строка — и кеш готов (с AOF persistence)
-    db, err := imcs.Open("./data")
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
-
-    // Всё как в Redis, но без TCP — прямые вызовы в RAM (~250ns)
-    db.Set("user:1", "John", time.Hour)
-    db.Set("config", "value", 0)        // вечный ключ
-
-    val, ok := db.Get("user:1")         // "John", true
-
-    db.Incr("counter")                  // 1
-    db.IncrBy("counter", 10)            // 11
-
-    db.SetNX("lock", "owner", 10*time.Second) // true (если не было)
-
-    db.MSet("k1", "v1", "k2", "v2")    // массовая запись
-    db.Keys("user:*")                   // ["user:1"]
-    db.Len()                            // количество ключей
-
-    // Если нужен TCP-сервер — одна строка:
-    go db.ListenAndServe(":6380")       // redis-cli подключится
-}
-```
-
-### Подключение через redis-cli
 
 ```bash
 redis-cli -p 6380
-
-127.0.0.1:6380> SET hello world
-OK
-127.0.0.1:6380> GET hello
-"world"
-127.0.0.1:6380> INCR counter
-(integer) 1
 127.0.0.1:6380> SET session:abc "userdata" EX 3600
 OK
 127.0.0.1:6380> TTL session:abc
-(integer) 3599
-127.0.0.1:6380> KEYS *
-1) "hello"
-2) "counter"
-3) "session:abc"
+(integer) 3600
 ```
 
-### Подключение из кода
+### Встраивание (без сети)
 
-**Go** (`go-redis`):
+> Чтобы импортировать пакет из другого модуля, путь модуля в `go.mod` должен
+> совпадать с репозиторием: `module github.com/CaloriaDigital-hub/IMCS`.
+
 ```go
-import "github.com/redis/go-redis/v9"
+import imcs "github.com/CaloriaDigital-hub/IMCS"
 
-rdb := redis.NewClient(&redis.Options{
-    Addr:     "localhost:6380",
-    Password: "mysecret", // если задан -auth
-})
+db, err := imcs.OpenWithOptions("./data", imcs.Options{MaxKeys: 1_000_000})
+if err != nil {
+    log.Fatal(err) // в т.ч. imcs.ErrCorrupt — см. «Повреждение журнала»
+}
+defer db.Close()
 
-rdb.Set(ctx, "key", "value", time.Hour)
-val, _ := rdb.Get(ctx, "key").Result()
+if err := db.Set("user:1", "John", time.Hour); err != nil {
+    // imcs.ErrPersistence: журнал не пишется (например, диск полон),
+    // изменение НЕ выполнено
+}
+val, ok := db.Get("user:1")
+
+n, err := db.Incr("counter")
+locked, err := db.SetNX("lock", "owner", 10*time.Second) // атомарно
+
+go db.ListenAndServe(":6380") // RESP-сервер поверх той же базы, с настройками из Options
 ```
 
-**Python** (`redis-py`):
-```python
-import redis
-r = redis.Redis(host='localhost', port=6380, password='mysecret')
-r.set('key', 'value', ex=3600)
-print(r.get('key'))
-```
-
-**Node.js** (`ioredis`):
-```javascript
-const Redis = require('ioredis');
-const redis = new Redis({ port: 6380, password: 'mysecret' });
-await redis.set('key', 'value', 'EX', 3600);
-const val = await redis.get('key');
-```
+Все операции записи возвращают ошибку: если журнал не принимает записи, изменение
+не применяется к памяти, чтобы память и диск не расходились.
 
 ---
 
 ## Команды
 
-### Строковые операции
-
-| Команда | Синтаксис | Описание |
-|---|---|---|
-| `SET` | `SET key value [EX sec] [PX ms] [NX\|XX]` | Установить значение |
-| `GET` | `GET key` | Получить значение |
-| `DEL` | `DEL key [key ...]` | Удалить ключи |
-| `SETNX` | `SETNX key value` | Установить, только если не существует |
-| `SETEX` | `SETEX key seconds value` | Установить с TTL |
-| `MSET` | `MSET key value [key value ...]` | Массовая установка |
-| `MGET` | `MGET key [key ...]` | Массовое чтение |
-| `INCR` | `INCR key` | Инкремент на 1 |
-| `DECR` | `DECR key` | Декремент на 1 |
-| `INCRBY` | `INCRBY key delta` | Инкремент на delta |
-| `DECRBY` | `DECRBY key delta` | Декремент на delta |
-| `APPEND` | `APPEND key value` | Дописать к значению |
-| `STRLEN` | `STRLEN key` | Длина строки |
-
-#### Опции SET
-
-```
-SET key value [EX seconds] [PX milliseconds] [NX] [XX]
-```
-
-- `EX seconds` — установить TTL в секундах
-- `PX milliseconds` — установить TTL в миллисекундах
-- `NX` — установить только если ключ **не существует**
-- `XX` — установить только если ключ **уже существует**
-
-### Управление ключами
-
-| Команда | Синтаксис | Описание |
-|---|---|---|
-| `EXISTS` | `EXISTS key [key ...]` | Проверить существование (возвращает кол-во) |
-| `EXPIRE` | `EXPIRE key seconds` | Установить TTL в секундах |
-| `PEXPIRE` | `PEXPIRE key ms` | Установить TTL в миллисекундах |
-| `TTL` | `TTL key` | Оставшееся время жизни (секунды) |
-| `PTTL` | `PTTL key` | Оставшееся время жизни (миллисекунды) |
-| `PERSIST` | `PERSIST key` | Убрать TTL (сделать вечным) |
-| `TYPE` | `TYPE key` | Тип значения |
-| `RENAME` | `RENAME old new` | Переименовать ключ |
-| `KEYS` | `KEYS pattern` | Поиск ключей по glob-паттерну |
-
-#### Коды возврата TTL/PTTL
-
-| Код | Значение |
+| Группа | Команды |
 |---|---|
-| `N` (положительное) | Оставшееся время жизни |
-| `-1` | Ключ существует, но без TTL |
-| `-2` | Ключ не найден |
+| Строки | `SET key value [NX\|XX] [EX s\|PX ms\|KEEPTTL]`, `GET`, `SETNX`, `SETEX`, `PSETEX`, `MSET`, `MGET`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN` |
+| Ключи | `DEL`, `UNLINK`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `RENAME`, `KEYS` |
+| Сервер | `AUTH [default] password`, `PING`, `ECHO`, `QUIT`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `INFO`, `SELECT 0`, `BGREWRITEAOF`, `COMMAND`, `CONFIG GET`, `CLIENT SETNAME/SETINFO` |
 
-### Серверные команды
+Семантика повторяет Redis: `SET NX` и `INCR` атомарны, `EXPIRE` с неположительным
+TTL удаляет ключ, `MSET` и `RENAME` атомарны, `KEYS` понимает `*`, `?`, `[a-z]`, `[^x]`, `\`.
 
-| Команда | Описание |
-|---|---|
-| `PING [message]` | Проверка соединения |
-| `ECHO message` | Эхо |
-| `DBSIZE` | Количество ключей |
-| `INFO` | Информация о сервере |
-| `FLUSHDB` | Очистить все данные |
-| `FLUSHALL` | Очистить все данные + cold storage |
-| `SELECT db` | Выбор БД (всегда OK) |
-| `AUTH password` | Аутентификация |
-| `QUIT` | Закрыть соединение |
-| `COMMAND` | Информация о командах |
-| `CONFIG SET key value` | Установить параметр (заглушка) |
-| `CLIENT ...` | Информация о клиенте (заглушка) |
+Отличия от Redis:
+- только строки (нет списков, хешей, множеств, pub/sub, Lua, транзакций);
+- одна база: `SELECT` с индексом ≠ 0 — ошибка, а не молчаливая запись в ту же базу;
+- только RESP2 (`HELLO 3` не поддерживается — клиенты откатываются на RESP2 сами);
+- нет репликации и кластера.
 
 ---
 
-## Архитектура
+## Персистентность
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                          IMCS Server                               │
-│                                                                    │
-│  ┌──────────────┐    ┌──────────────────────────────────────────┐  │
-│  │  TCP Listener │──▶│         RESP Parser (inline + multibulk) │  │
-│  │  (port 6380)  │    │         + AUTH check                     │  │
-│  └──────────────┘    └────────────────┬─────────────────────────┘  │
-│                                       │                            │
-│                                       ▼                            │
-│  ┌────────────────────────────────────────────────────────────────┐│
-│  │                    Command Router                              ││
-│  │  SET  GET  DEL  INCR  EXPIRE  TTL  KEYS  MGET  MSET  ...     ││
-│  └────────────────────────────┬───────────────────────────────────┘│
-│                               │                                    │
-│                               ▼                                    │
-│  ┌────────────────────────────────────────────────────────────────┐│
-│  │              Sharded Cache (64 шарда × RWMutex)               ││
-│  │                                                                ││
-│  │  ┌────────┐ ┌────────┐ ┌────────┐         ┌────────┐         ││
-│  │  │ Shard 0│ │ Shard 1│ │ Shard 2│  . . .  │Shard 63│         ││
-│  │  │ map+pq │ │ map+pq │ │ map+pq │         │ map+pq │         ││
-│  │  └────────┘ └────────┘ └────────┘         └────────┘         ││
-│  └────────────────────────────┬───────────────────────────────────┘│
-│                               │                                    │
-│              ┌────────────────┴────────────────────┐               │
-│              │                                     │               │
-│              ▼                                     ▼               │
-│  ┌──────────────────────┐            ┌─────────────────────────┐  │
-│  │     AOF Persister    │            │     Cold Storage        │  │
-│  │  ┌────────────────┐  │            │  (gob files на диске)   │  │
-│  │  │ CRC64 + Write  │  │            └─────────────────────────┘  │
-│  │  │ Rewrite buffer │  │                       ▲                  │
-│  │  │ Fsync 1/sec    │  │                       │                  │
-│  │  └────────────────┘  │            ┌─────────────────────────┐  │
-│  └──────────────────────┘            │       Janitor           │  │
-│                                      │  TTL Expiry (1с, heap)  │  │
-│                                      │  Cold Eviction (10с)    │  │
-│                                      │  Disk Flush (30с)       │  │
-│                                      └─────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
-```
+- **AOF-журнал** `<dir>/journal.aof`, бинарно-безопасный формат с CRC64 на запись:
+  значения могут содержать `\n`, `|`, нулевые байты, размер ключа и значения — до 512 МБ.
+- **fsync раз в секунду** (как `appendfsync everysec`): при падении процесса или
+  питания теряется не больше ~1–2 с последних записей.
+- В журнал пишутся все изменения: `SET`, `DEL`, TTL (`EXPIRE`/`PERSIST`), `FLUSHALL`,
+  вытеснение по `MaxKeys`. TTL хранится как абсолютное время.
+- **Ошибка записи на диск** (например, диск полон) не глотается: команды записи
+  отвечают `-MISCONF`, чтение работает. После устранения причины нужен перезапуск.
+- **Компактность**: журнал автоматически переписывается, когда вырос вдвое с прошлого
+  rewrite и больше 64 МБ. Вручную — `BGREWRITEAOF`.
+- **Старый формат** журнала (`crc|cmd|key|expire|value`) читается и при первом запуске
+  автоматически переводится в новый.
 
-### Ключевые решения
+### Повреждение журнала
 
-#### Шардирование (64 шарда)
-
-Каждый ключ попадает в один из 64 шардов по хешу FNV-1a. Каждый шард имеет свой `sync.RWMutex`, что обеспечивает минимальный contention при конкурентном доступе тысяч горутин.
-
-#### Min-Heap для TTL
-
-Ключи с TTL хранятся в priority queue (min-heap), отсортированной по `ExpireAt`. При cleanup janitor смотрит только вершину heap — O(1) вместо O(N) полного сканирования.
-
-#### AOF с CRC64
-
-Каждая запись в AOF-журнале содержит контрольную сумму CRC64 (ECMA). При восстановлении проверяется целостность каждой записи. Повреждённые записи отсекаются — файл truncate до последней валидной записи.
-
-#### AOF Rewrite
-
-Пока идёт snapshot → запись нового файла, все новые записи дублируются в `rewriteBuf`. После записи snapshot, буфер дописывается, и файл атомарно заменяется через `os.Rename`. Ни одна запись не теряется.
-
-#### Cold Storage
-
-Данные, не востребованные более 5 минут, автоматически выгружаются на диск (gob). При обращении к ключу — данные поднимаются обратно в RAM. Это позволяет экономить оперативную память.
+- Оборванная последняя запись (краш во время записи) отрезается автоматически.
+- Повреждение **в середине** журнала — сервер не стартует и пишет смещение.
+  Молча выкидывать всё, что после, нельзя. Если потеря данных после этого места
+  допустима, запустите с `-aof-repair`.
 
 ---
 
-## Производительность
+## Безопасность
 
-Результаты тестирования на одной машине (столько же горутин = столько же клиентов):
-
-| Тест | Результат |
-|---|---|
-| **TCP Throughput (RESP)** | **1,205,879 ops/sec** |
-| **In-Memory Throughput** | **4,047,963 ops/sec** |
-| Avg TCP latency | 829ns/op |
-| Avg in-memory latency | 247ns/op |
-| INCR throughput | 1,211,479 atomic/sec |
-| Pipeline (2000 cmd) | 312,577 ops/sec |
-| Big values (GET 1MB) | 917 MB/sec |
-| Max connections (tested) | 2,000 simultaneous |
-| Mixed chaos (15 commands) | 1,183,341 ops/sec |
-| Binary size (stripped) | ~4MB |
-| RAM at start | ~5MB |
+- **Protected mode** (по умолчанию): без пароля принимаются только соединения с
+  loopback. Задайте пароль (`-auth` или `IMCS_PASSWORD`) или, в доверенной сети,
+  `-protected-mode=false`.
+- Пароль лучше передавать через `IMCS_PASSWORD`: аргументы командной строки видны в `ps`.
+- До `AUTH` действуют жёсткие лимиты протокола (≤10 аргументов, ≤16 КБ на аргумент),
+  так что неавторизованный клиент не может заставить сервер выделить много памяти.
+- Лимиты после `AUTH`: 1М аргументов, 512 МБ на аргумент, 64 КБ inline-строка.
+  Память под большой аргумент выделяется по мере прихода данных.
+- `-maxclients` (по умолчанию 10 000) ограничивает число соединений.
+- Паника при обработке команды закрывает только это соединение, сервер продолжает работу.
 
 ---
-
-## Benchmarking Environment
-
-Benchmarks were performed on the following hardware and software setup to ensure reproducibility:
-
-## Hardware
-*   **CPU:** Intel(R) Core(TM) i9-13900H (14 Cores / 20 Threads)
-    *   **Max Turbo Frequency:** 5.40 GHz
-    *   **L3 Cache:** 24 MiB
-*   **RAM:** 16 GB DDR5 4800 MT/s (2x8GB)
-*   **Architecture:** x86_64
-
-## Software
-
-   **OS:** Linux Mint 22.3 (Zena)
-   **Kernel:** 6.17.0-14-generic
-   **Go Version:** go1.25.6 linux/amd64
 
 ## Конфигурация
 
-### Флаги командной строки
-
 | Флаг | По умолчанию | Описание |
 |---|---|---|
-| `-port` | `:6380` | TCP-адрес и порт для прослушивания |
-| `-dir` | `./cache-files` | Директория для AOF-журнала и cold storage |
-| `-auth` | `""` | Пароль для команды AUTH (пустой = без аутентификации) |
+| `-port` | `:6380` | адрес (`host:port` или `:port`) |
+| `-dir` | `./cache-files` | каталог журнала |
+| `-auth` | `""` | пароль; или переменная `IMCS_PASSWORD` |
+| `-maxkeys` | `0` | лимит ключей, выше — вытеснение (sampled LRU); 0 = без лимита |
+| `-maxclients` | `10000` | лимит соединений |
+| `-timeout` | `0` | закрывать простаивающие соединения (например `5m`); 0 = никогда |
+| `-protected-mode` | `true` | без пароля — только loopback-клиенты |
+| `-aof-repair` | `false` | обрезать журнал по месту повреждения в середине |
 
-### Примеры
-
-```bash
-# Продакшн: кастомный порт, отдельная директория данных, пароль
-./imcs -port :6379 -dir /var/lib/imcs -auth $(openssl rand -hex 16)
-
-# Разработка: стандартные настройки
-./imcs
-
-# Тестирование: отдельный порт
-./imcs -port :16380 -dir /tmp/imcs-test
-```
+`SIGINT`/`SIGTERM` — graceful shutdown: новые соединения не принимаются, уже
+полученные команды выполняются (до 5 с), журнал сбрасывается на диск.
 
 ---
 
 ## Docker
 
-### Сборка и запуск
-
 ```bash
-# Сборка образа
 docker build -t imcs .
-
-# Запуск
-docker run -d \
-  --name imcs \
-  -p 6380:6380 \
-  -v imcs-data:/data \
-  imcs
-
-# С паролем
-docker run -d \
-  --name imcs \
-  -p 6380:6380 \
-  -v imcs-data:/data \
-  imcs -auth mysecretpassword
-
-# Проверка
-redis-cli -p 6380 PING
+docker run -d --name imcs -p 6380:6380 -v imcs-data:/data -e IMCS_PASSWORD=secret imcs
+redis-cli -p 6380 -a secret PING
 ```
 
-### Docker Compose
+Контейнер работает от непривилегированного пользователя. Без пароля protected mode
+не пустит клиентов снаружи контейнера.
 
-```yaml
-version: '3.8'
-services:
-  imcs:
-    build: .
-    ports:
-      - "6380:6380"
-    volumes:
-      - imcs-data:/data
-    command: ["-auth", "${IMCS_PASSWORD:-}"]
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 256M
+---
 
-volumes:
-  imcs-data:
-```
+## Производительность
+
+Замеры на Intel i9-13900H (20 потоков), WSL2, Go 1.26. Клиент и сервер в одном
+процессе на тех же ядрах, loopback, без pipelining, 200 соединений.
+Latency — время одного запроса у клиента.
+
+| Сценарий | Throughput | p50 | p99 |
+|---|---|---|---|
+| TCP, 80% GET / 20% SET, с AOF | ~610K ops/s | 250 µs | 1.6 ms |
+| TCP, 100% SET, с AOF | ~590K ops/s | 270 µs | 1.5 ms |
+| In-process `Get`, 16 горутин | ~42M ops/s | — | — |
+| In-process `Set` с AOF | ~2M ops/s | — | — |
+
+Все записи проходят через один поток журнала, поэтому `Set` с AOF упирается в
+~2M ops/s независимо от числа ядер (у Redis то же ограничение). Сравнения с Redis
+на одном железе нет — меряйте на своей нагрузке:
+`go test -run TestTCPStress -v ./internal/server/`.
 
 ---
 
 ## Тестирование
 
 ```bash
-# Все тесты
-go test ./...
-
-# С выводом
-go test -v ./...
-
-# Только server hard тесты
-go test -v -run 'TestHard' ./internal/server/
-
-# Только AOF тесты
-go test -v ./internal/persistence/AOF/
-
-# С race detector
 go test -race ./...
 ```
 
-### Результаты тестов (17/17 PASS)
-
-| Пакет | Тесты | Результат |
-|---|---|---|
-| `internal/server` | RESP Protocol (50 cmd), TCP Stress (5M ops), Atomic INCR, Pipeline Burst, TTL Expiry, Big Values (1MB), Max Connections (2000), Mixed Chaos | ✅ 8/8 |
-| `internal/persistence/AOF` | CRC64, Corruption Truncate (3 сценария), Rewrite, Crash No Flush, Heavy Load Crash | ✅ 5/5 |
-| `internal/storage` | LRU Eviction, LRU Stress, 50K Users Stress, Burst | ✅ 4/4 |
-
----
-
-## Сравнение с Redis
-
-| Возможность | IMCS | Redis 7.x |
-|---|---|---|
-| TCP Throughput | **1.2M ops/sec** | ~100-200K ops/sec |
-| Binary | ~4MB | ~12MB |
-| RAM (старт) | ~5MB | ~10MB |
-| Docker image | ~15MB | ~50MB |
-| Зависимости | **0** | libc, jemalloc |
-| RESP протокол | ✅ | ✅ |
-| AOF persistence | ✅ CRC64 | ✅ |
-| AOF Rewrite | ✅ | ✅ |
-| Cold storage (диск) | ✅ | ❌ |
-| Строки | ✅ | ✅ |
-| Списки, множества, хеши | ❌ | ✅ |
-| Pub/Sub | ❌ | ✅ |
-| Lua скрипты | ❌ | ✅ |
-| Кластер | ❌ | ✅ |
-
-### Когда использовать IMCS
-
-- **Микросервисы** — встраиваемый кеш без внешних зависимостей
-- **Rate limiting** — INCR atomic, 1.2M ops/sec через TCP
-- **Сессии** — SET с EX + GET, AOF persistence
-- **Счётчики** — INCR/DECRBY, данные не теряются при рестарте
-- **Edge / IoT** — 5MB RAM, 4MB binary
-- **CI/CD тесты** — мгновенный старт, не нужен Docker Redis
-
-### Когда использовать Redis
-
-- Нужны структуры данных: Sets, Sorted Sets, Hashes, Streams
-- Нужен Pub/Sub или Lua скрипты
-- Нужен кластер с шардированием по нодам
-- Нужно 100K+ одновременных соединений
-
----
-
-## Участие в разработке
-
-Мы приветствуем вклад в проект! Для участия:
-
-1. Форкните репозиторий
-2. Создайте ветку для вашей функции (`git checkout -b feature/my-feature`)
-3. Зафиксируйте изменения (`git commit -m 'feat: описание'`)
-4. Отправьте ветку (`git push origin feature/my-feature`)
-5. Откройте Pull Request
-
-### Рекомендации
-
-- Пишите тесты для новых функций
-- Следуйте стилю кода Go (`gofmt`, `go vet`)
-- Обновляйте документацию при добавлении команд
-- Используйте conventional commits: `feat:`, `fix:`, `docs:`, `test:`
+Тесты проверяют корректность, а не только печатают цифры: переживание рестарта
+для бинарных значений, `\n`, `|` и значений больше 16 МБ, обрезку оборванного хвоста,
+отказ на повреждении в середине, rewrite под параллельной записью, атомарность
+`SET NX` и `INCR`, точный счётчик ключей, лимиты протокола до `AUTH`, graceful shutdown.
 
 ---
 
 ## Лицензия
 
-Этот проект распространяется под лицензией **MIT**. Подробности в файле [LICENSE](LICENSE).
-
----
-
-<p align="center">
-  <strong>IMCS</strong> — когда Redis слишком тяжёл, а HashMap недостаточно.<br>
-  <em>~4600 строк Go · 0 зависимостей · 17 тестов · 1.2M ops/sec</em>
-</p>
+MIT — см. [LICENSE](LICENSE).

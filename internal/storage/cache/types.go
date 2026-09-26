@@ -1,109 +1,73 @@
 package storage
 
 import (
-	"runtime"
-
+	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
-
-	"imcs/internal/storage/cold"
 )
 
-/*
-	Кастомная легковесная блокировка
-	0: свободен, >0: кол-во readers, -1: писатель захватил
-*/
-type SpinRWMutex int32
-
-func (m *SpinRWMutex) RLock () {
-	for i := 0; ; i++ {
-		if i > 30 {
-			runtime.Gosched()
-		}
-
-		v:=atomic.LoadInt32((*int32)(m))
-
-		if v >= 0 && atomic.CompareAndSwapInt32((*int32)(m), v, v+1) {
-			break
-		}
-	}
-}
-func (m *SpinRWMutex) RUnlock() {
-	atomic.AddInt32((*int32)(m), -1)
-}
-
-
-
-func (m *SpinRWMutex) Lock() {
-	for i := 0; !atomic.CompareAndSwapInt32((*int32)(m), 0, -1); i++ {
-		if i > 30 {
-			runtime.Gosched()
-		}
-	}
-}
-
-func (m *SpinRWMutex) Unlock() {
-	atomic.StoreInt32((*int32)(m), 0)
-}
-
-
-// Persistence — интерфейс для персистенции данных
+// Persistence — журнал изменений.
+//
+// Write вызывается под локом шарда, поэтому порядок записей по каждому ключу
+// совпадает с порядком изменений в памяти. Реализация не должна брать локи
+// шардов. expireAt — абсолютное время (unix ns), 0 = без TTL.
 type Persistence interface {
-	Write(cmd, key, value string, duration time.Duration) error
+	Write(cmd, key, value string, expireAt int64) error
+	Err() error
 }
 
+// Команды журнала (совпадают с AOF.Cmd*).
+const (
+	logSet      = "SET"
+	logDel      = "DEL"
+	logExpireAt = "EXPIREAT"
+	logFlushAll = "FLUSHALL"
+)
 
+var (
+	ErrNotInteger    = errors.New("value is not an integer or out of range")
+	ErrOverflow      = errors.New("increment or decrement would overflow")
+	ErrNoSuchKey     = errors.New("no such key")
+	ErrInvalidExpire = errors.New("invalid expire time")
+	// ErrPersistence — журнал не принимает записи; изменение не выполнено.
+	ErrPersistence = errors.New("persistence failure")
+)
 
-
-// Item — элемент кеша
-type Item struct {
-	Key        string
-	Value      string
-	ExpireAt   int64
-	LastAccess int64
-	HeapIndex  int
+// SetOptions — опции SET.
+type SetOptions struct {
+	TTL     time.Duration // > 0: ключ истечёт через TTL
+	NX      bool          // только если ключа нет
+	XX      bool          // только если ключ есть
+	KeepTTL bool          // сохранить текущий TTL
 }
 
-// priorityQueue — очередь с приоритетом для TTL
+// GetResult — результат MGet.
+type GetResult struct {
+	Value string
+	Found bool
+}
+
+// priorityQueue — min-heap по ExpireAt (только ключи с TTL).
 type priorityQueue []*Item
 
-
-
-
-
-// shard — один шард кеша.
+// shard — один шард кеша. Все поля под RWMutex.
 type shard struct {
-	SpinRWMutex
+	sync.RWMutex
 	items map[string]*Item
 	pq    priorityQueue
+	count *atomic.Int64 // общий счётчик ключей кеша
 }
-
-type ItemSnapshot struct {
-	Value 		string
-	ExpireAt 	int64
-}
-
-
-
-
-// coldItem — элемент для передачи в cold storage через канал.
-type coldItem struct {
-	key      string
-	value    string
-	expireAt int64
-}
-
-
-
-
 
 // Cache — шардированное in-memory хранилище.
 type Cache struct {
 	shards    [shardCount]*shard
 	persister Persistence
-	cold      *cold.Store  
-	flushCh   chan coldItem
 	maxKeys   int64
 	totalKeys atomic.Int64
-	stopCh    chan struct{}
 }
+
+type nopPersistence struct{}
+
+func (nopPersistence) Write(string, string, string, int64) error { return nil }
+func (nopPersistence) Err() error                                { return nil }

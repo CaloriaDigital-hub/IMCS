@@ -2,118 +2,162 @@ package AOF
 
 import (
 	"bufio"
-	"hash/crc64"
+	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"strconv"
 )
 
-// Rewrite компактит AOF с буфером докатки (как Redis).
+// Rewrite компактит журнал: снапшот живых ключей + буфер докатки.
 //
-// Алгоритм:
-//  1. Включаем rewriting flag → backgroundWriter начинает дублировать записи в rewriteBuf
-//  2. Делаем Snapshot через callback — пишем живые ключи в новый файл
-//  3. Останавливаем backgroundWriter на мьютексе
-//  4. Дописываем rewriteBuf (записи, пришедшие во время snapshot) в новый файл
-//  5. Atomic rename нового файла → старый
-//  6. Переоткрываем файл для дальнейших записей
-//  7. Выключаем rewriting flag
+//  1. Включаем rewriting: каждая запись, которую writer пишет в старый файл,
+//     дублируется в rewriteBuf.
+//  2. Пишем снапшот во временный файл (без a.mu — writer продолжает работать).
+//  3. Под a.mu дописываем rewriteBuf, fsync, атомарно подменяем файл.
 //
-// Новые записи НЕ теряются — они в rewriteBuf.
-func (a *AOF) Rewrite(snapshot func(fn func(cmd, key, value string, expireAt int64))) error {
-	tmpPath := filepath.Join(a.dir, "journal.aof.rewrite")
+// Запись, попавшая и в снапшот, и в буфер, применится повторно — это безопасно,
+// потому что все записи журнала — абсолютные присваивания (см. types.go), а
+// порядок записей по каждому ключу совпадает с порядком изменений в памяти.
+//
+// snapshot должен вызвать emit для каждого живого ключа.
+func (a *AOF) Rewrite(snapshot func(emit func(cmd, key, value string, expire int64))) (err error) {
+	if !a.rewriteRunning.CompareAndSwap(false, true) {
+		return ErrRewriteInProgress
+	}
+	defer a.rewriteRunning.Store(false)
 
-	tmpFile, err := os.Create(tmpPath)
+	if err := a.Err(); err != nil {
+		return err
+	}
+
+	tmpPath := a.path + ".rewrite"
+	tmp, err := os.Create(tmpPath)
 	if err != nil {
 		return err
 	}
+	w := bufio.NewWriterSize(tmp, writeBufSize)
 
-	writer := bufio.NewWriterSize(tmpFile, writeBufSize)
-	written := 0
+	swapped := false
+	defer func() {
+		if swapped {
+			return
+		}
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		a.mu.Lock()
+		a.rewriting = false
+		a.rewriteBuf = nil
+		a.mu.Unlock()
+	}()
 
-	// === Шаг 1: Включаем буфер докатки ===
-	a.rewriteMu.Lock()
-	a.rewriteBuf = a.rewriteBuf[:0] // очищаем
-	a.rewriteMu.Unlock()
-	a.rewriting.Store(true)
+	// === 1. Включаем буфер докатки ===
+	a.mu.Lock()
+	a.rewriting = true
+	a.rewriteBuf = nil
+	a.mu.Unlock()
 
-	// === Шаг 2: Snapshot — пишем живые ключи ===
-	snapshot(func(cmd, key, value string, expireAt int64) {
-		payload := make([]byte, 0, len(cmd)+len(key)+len(value)+32)
-		payload = append(payload, cmd...)
-		payload = append(payload, '|')
-		payload = append(payload, key...)
-		payload = append(payload, '|')
-		payload = strconv.AppendInt(payload, expireAt, 10)
-		payload = append(payload, '|')
-		payload = append(payload, value...)
-
-		checksum := crc64.Checksum(payload, crcTable)
-		crcHex := strconv.FormatUint(checksum, 16)
-
-		entry := make([]byte, 0, len(crcHex)+1+len(payload)+1)
-		entry = append(entry, crcHex...)
-		entry = append(entry, '|')
-		entry = append(entry, payload...)
-		entry = append(entry, '\n')
-
-		writer.Write(entry)
+	// === 2. Снапшот ===
+	var (
+		scratch []byte
+		werr    error
+		written int
+	)
+	snapshot(func(cmd, key, value string, expire int64) {
+		if werr != nil {
+			return
+		}
+		scratch, _, werr = writeRecord(w, scratch, record{cmd: cmd, key: key, value: value, expire: expire})
 		written++
 	})
-
-	// === Шаг 3-4: Забираем записи из буфера докатки ===
-	// Останавливаем rewriting ПОСЛЕ забора буфера
-	a.rewriteMu.Lock()
-	buffered := make([][]byte, len(a.rewriteBuf))
-	copy(buffered, a.rewriteBuf)
-	a.rewriteBuf = a.rewriteBuf[:0]
-	a.rewriting.Store(false) // новые записи больше не дублируются
-	a.rewriteMu.Unlock()
-
-	// Дописываем буфер докатки в новый файл
-	for _, entry := range buffered {
-		writer.Write(entry)
-		written++
+	if werr != nil {
+		return werr
 	}
-
-	if err := writer.Flush(); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
+	if err := w.Flush(); err != nil {
 		return err
 	}
-	if err := tmpFile.Sync(); err != nil {
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	tmpFile.Close()
 
-	// === Шаг 5-6: Atomic rename ===
+	// === 3. Докатка и подмена под a.mu ===
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.writer.Flush()
-	a.file.Sync()
-	a.file.Close()
+	buffered := a.rewriteBuf
+	a.rewriting = false
+	a.rewriteBuf = nil
 
-	origPath := filepath.Join(a.dir, "journal.aof")
-
-	if err := os.Rename(tmpPath, origPath); err != nil {
-		// Восстанавливаем старый файл
-		f, _ := os.OpenFile(origPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-		a.file = f
-		a.writer = bufio.NewWriterSize(f, writeBufSize)
+	for _, r := range buffered {
+		if scratch, _, err = writeRecord(w, scratch, r); err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	st, err := tmp.Stat()
+	if err != nil {
+		return err
+	}
+	// Windows: открытый файл нельзя переименовать.
+	if err := tmp.Close(); err != nil {
 		return err
 	}
 
-	f, err := os.OpenFile(origPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	// Старый файл дописываем до конца: если rename упадёт, он остаётся актуальным.
+	if err := a.writer.Flush(); err != nil {
+		a.fail(err)
+		return err
+	}
+	if err := a.file.Sync(); err != nil {
+		a.fail(err)
+		return err
+	}
+	_ = a.file.Close() // уже сброшен и синхронизирован выше
+
+	if err := os.Rename(tmpPath, a.path); err != nil {
+		if reopenErr := a.reopenLocked(); reopenErr != nil {
+			a.fail(reopenErr)
+			return fmt.Errorf("rename failed: %v; reopen failed: %w", err, reopenErr)
+		}
+		return err
+	}
+	swapped = true
+	syncDir(a.dir)
+
+	if err := a.reopenLocked(); err != nil {
+		a.fail(err)
+		return err
+	}
+	a.size = st.Size()
+	a.dirty = false
+	a.lastRewriteSize.Store(a.size)
+
+	log.Printf("AOF rewrite: %d keys + %d buffered records, %d bytes", written, len(buffered), a.size)
+	return nil
+}
+
+// RewriteRunning сообщает, идёт ли сейчас rewrite.
+func (a *AOF) RewriteRunning() bool {
+	return a.rewriteRunning.Load()
+}
+
+func (a *AOF) reopenLocked() error {
+	f, err := os.OpenFile(a.path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
 	a.file = f
-	a.writer = bufio.NewWriterSize(f, writeBufSize)
-
-	log.Printf("AOF rewrite: %d entries (incl %d buffered during rewrite)", written, len(buffered))
+	a.writer.Reset(f)
 	return nil
+}
+
+// syncDir делает fsync каталога, чтобы rename пережил потерю питания.
+// На Windows каталоги не синхронизируются — ошибку игнорируем.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }

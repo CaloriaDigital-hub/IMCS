@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go build *)",
+      "Bash(go test *)",
+      "Bash(git stash *)",
+      "Bash(GOMAXPROCS=2 go test ./internal/storage/cache/... -bench=. -benchmem -benchtime=5s -count=1)",
+      "Bash(GOMAXPROCS=2 go test ./internal/persistence/AOF/... -bench=. -benchmem -benchtime=5s -count=1)",
+      "Bash(GOMAXPROCS=2 go test ./internal/server/... -run=\"TestTCPStress50K|TestHardPipelineBurst|TestHardAtomicIncr|TestHardMixedChaos\" -count=1 -timeout=180s -v)",
+      "Bash(GOMAXPROCS=2 go test ./internal/server/... -run=\"TestTCPStress50K|TestHardPipelineBurst|TestHardAtomicIncr|TestHardMixedChaos|TestHardBigValues|TestHardTTLExpiry\" -count=1 -timeout=180s -v)",
+      "Bash(go vet *)",
+      "Bash(GOMAXPROCS=2 go test ./internal/server/... -run=\"TestRESPProtocol|TestHardMixedChaos|TestHardTTLExpiry|TestHardMaxConnections|TestHardAtomicIncr|TestHardPipelineBurst|TestHardBigValues|TestTCPStress50K\" -count=1 -timeout=120s)",
+      "Bash(GOMAXPROCS=2 go test ./internal/server/... -run=\"TestHardMixedChaos|TestHardTTLExpiry|TestHardMaxConnections\" -count=1 -timeout=60s -v)"
+    ]
+  }
+}

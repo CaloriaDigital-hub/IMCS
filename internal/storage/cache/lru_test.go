@@ -11,25 +11,27 @@ func TestLRUEviction(t *testing.T) {
 	const maxKeys = 1000
 
 	c := NewWithMaxKeys(&mockPersistence{}, maxKeys)
-	defer c.Close()
 
 	// Заполняем до лимита
 	for i := 0; i < maxKeys; i++ {
-		c.Set("key:"+strconv.Itoa(i), "val", 0, false)
+		c.Set("key:"+strconv.Itoa(i), "val", SetOptions{})
 	}
 
 	if count := c.CountKeys(); count != maxKeys {
 		t.Fatalf("expected %d keys, got %d", maxKeys, count)
 	}
 
-	// «Прогреваем» первые 100 ключей — они должны выжить
+	// «Прогреваем» первые 100 ключей — они должны выжить.
+	// LRU-часы тикают раз в clockResolution: без паузы «горячие» и «холодные»
+	// ключи неразличимы.
+	time.Sleep(2 * clockResolution)
 	for i := 0; i < 100; i++ {
 		c.Get("key:" + strconv.Itoa(i))
 	}
 
 	// Добавляем 500 новых — LRU должен вытеснить старые
 	for i := maxKeys; i < maxKeys+500; i++ {
-		c.Set("key:"+strconv.Itoa(i), "newval", 0, false)
+		c.Set("key:"+strconv.Itoa(i), "newval", SetOptions{})
 	}
 
 	count := c.CountKeys()
@@ -62,11 +64,10 @@ func TestLRUEvictionUnderStress(t *testing.T) {
 	const maxKeys int64 = 10_000
 
 	c := NewWithMaxKeys(&mockPersistence{}, maxKeys)
-	defer c.Close()
 
 	// Вставляем 50К ключей — должен держаться около лимита
 	for i := 0; i < 50_000; i++ {
-		c.Set("stress:"+strconv.Itoa(i), "val:"+strconv.Itoa(i), time.Minute, false)
+		c.Set("stress:"+strconv.Itoa(i), "val:"+strconv.Itoa(i), SetOptions{TTL: time.Minute})
 	}
 
 	count := c.CountKeys()

@@ -12,9 +12,8 @@ import (
 // mockPersistence — мок для бенчмарков, не пишет на диск.
 type mockPersistence struct{}
 
-func (m *mockPersistence) Write(cmd, key, value string, duration time.Duration) error {
-	return nil
-}
+func (m *mockPersistence) Write(cmd, key, value string, expireAt int64) error { return nil }
+func (m *mockPersistence) Err() error                                         { return nil }
 
 func newTestCache() *Cache {
 	return New(&mockPersistence{})
@@ -24,41 +23,37 @@ func newTestCache() *Cache {
 
 func BenchmarkSet(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Set("key"+strconv.Itoa(i), "value", 0, false)
+		c.Set("key"+strconv.Itoa(i), "value", SetOptions{})
 	}
 }
 
 func BenchmarkSetWithTTL(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Set("key"+strconv.Itoa(i), "value", 5*time.Minute, false)
+		c.Set("key"+strconv.Itoa(i), "value", SetOptions{TTL: 5 * time.Minute})
 	}
 }
 
 func BenchmarkSetNX(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		c.Set("key"+strconv.Itoa(i), "value", 0, true)
+		c.Set("key"+strconv.Itoa(i), "value", SetOptions{NX: true})
 	}
 }
 
 func BenchmarkGet(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	// Предзаполнение
 	for i := 0; i < 10000; i++ {
-		c.Set("key"+strconv.Itoa(i), "value"+strconv.Itoa(i), 0, false)
+		c.Set("key"+strconv.Itoa(i), "value"+strconv.Itoa(i), SetOptions{})
 	}
 
 	b.ResetTimer()
@@ -69,7 +64,6 @@ func BenchmarkGet(b *testing.B) {
 
 func BenchmarkGetMiss(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -79,10 +73,9 @@ func BenchmarkGetMiss(b *testing.B) {
 
 func BenchmarkDelete(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	for i := 0; i < b.N; i++ {
-		c.Set("key"+strconv.Itoa(i), "value", 0, false)
+		c.Set("key"+strconv.Itoa(i), "value", SetOptions{})
 	}
 
 	b.ResetTimer()
@@ -95,13 +88,12 @@ func BenchmarkDelete(b *testing.B) {
 
 func BenchmarkSetParallel(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		i := 0
 		for pb.Next() {
-			c.Set("key"+strconv.Itoa(i), "value", 0, false)
+			c.Set("key"+strconv.Itoa(i), "value", SetOptions{})
 			i++
 		}
 	})
@@ -109,10 +101,9 @@ func BenchmarkSetParallel(b *testing.B) {
 
 func BenchmarkGetParallel(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	for i := 0; i < 10000; i++ {
-		c.Set("key"+strconv.Itoa(i), "value", 0, false)
+		c.Set("key"+strconv.Itoa(i), "value", SetOptions{})
 	}
 
 	b.ResetTimer()
@@ -127,10 +118,9 @@ func BenchmarkGetParallel(b *testing.B) {
 
 func BenchmarkMixedReadWrite(b *testing.B) {
 	c := newTestCache()
-	defer c.Close()
 
 	for i := 0; i < 10000; i++ {
-		c.Set("key"+strconv.Itoa(i), "value", 0, false)
+		c.Set("key"+strconv.Itoa(i), "value", SetOptions{})
 	}
 
 	b.ResetTimer()
@@ -141,7 +131,7 @@ func BenchmarkMixedReadWrite(b *testing.B) {
 			if i%10 < 8 {
 				c.Get(key) // 80% чтение
 			} else {
-				c.Set(key, "newval", 0, false) // 20% запись
+				c.Set(key, "newval", SetOptions{}) // 20% запись
 			}
 			i++
 		}
@@ -154,7 +144,6 @@ func BenchmarkSetScaling(b *testing.B) {
 	for _, goroutines := range []int{1, 4, 8, 16, 32, 64} {
 		b.Run(fmt.Sprintf("goroutines-%d", goroutines), func(b *testing.B) {
 			c := newTestCache()
-			defer c.Close()
 
 			var wg sync.WaitGroup
 			opsPerGoroutine := b.N / goroutines
@@ -169,7 +158,7 @@ func BenchmarkSetScaling(b *testing.B) {
 					defer wg.Done()
 					base := id * opsPerGoroutine
 					for i := 0; i < opsPerGoroutine; i++ {
-						c.Set("key"+strconv.Itoa(base+i), "value", 0, false)
+						c.Set("key"+strconv.Itoa(base+i), "value", SetOptions{})
 					}
 				}(g)
 			}
@@ -191,12 +180,11 @@ func BenchmarkSetValueSizes(b *testing.B) {
 
 		b.Run(fmt.Sprintf("value-%dB", size), func(b *testing.B) {
 			c := newTestCache()
-			defer c.Close()
 			val := randString(size)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				c.Set("key"+strconv.Itoa(i), val, 0, false)
+				c.Set("key"+strconv.Itoa(i), val, SetOptions{})
 			}
 		})
 	}
@@ -208,10 +196,9 @@ func BenchmarkGetWithLoad(b *testing.B) {
 	for _, numKeys := range []int{100, 1000, 10000, 100000} {
 		b.Run(fmt.Sprintf("keys-%d", numKeys), func(b *testing.B) {
 			c := newTestCache()
-			defer c.Close()
 
 			for i := 0; i < numKeys; i++ {
-				c.Set("key"+strconv.Itoa(i), "value", 0, false)
+				c.Set("key"+strconv.Itoa(i), "value", SetOptions{})
 			}
 
 			b.ResetTimer()
